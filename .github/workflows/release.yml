@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  BINARY_NAME: pixel-project
+
+jobs:
+  build:
+    name: Build ${{ matrix.os_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            os_name: macos
+            artifact: DrawMePix-macos.zip
+          - os: windows-latest
+            os_name: windows
+            artifact: DrawMePix-windows.zip
+          - os: ubuntu-latest
+            os_name: linux
+            artifact: DrawMePix-linux.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Dépendances Linux
+        if: matrix.os_name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev libgtk-3-dev
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Package macOS .app
+        if: matrix.os_name == 'macos'
+        run: |
+          APP="DrawMePix.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/release/${BINARY_NAME}" "$APP/Contents/MacOS/DrawMePix"
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key><string>DrawMePix</string>
+              <key>CFBundleDisplayName</key><string>DrawMePix</string>
+              <key>CFBundleIdentifier</key><string>fr.matteo.drawmepix</string>
+              <key>CFBundleVersion</key><string>${GITHUB_REF_NAME#v}</string>
+              <key>CFBundleExecutable</key><string>DrawMePix</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>LSMinimumSystemVersion</key><string>10.13</string>
+              <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          zip -r "${{ matrix.artifact }}" "$APP"
+
+      - name: Package Windows .zip
+        if: matrix.os_name == 'windows'
+        shell: pwsh
+        run: |
+          mkdir release
+          Copy-Item "target/release/${env:BINARY_NAME}.exe" "release/DrawMePix.exe"
+          Compress-Archive -Path "release/*" -DestinationPath "${{ matrix.artifact }}"
+
+      - name: Package Linux tar.gz
+        if: matrix.os_name == 'linux'
+        run: |
+          mkdir release
+          cp "target/release/${BINARY_NAME}" release/drawmepix
+          chmod +x release/drawmepix
+          tar -czf "${{ matrix.artifact }}" -C release .
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}
