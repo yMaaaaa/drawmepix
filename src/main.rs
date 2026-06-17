@@ -2,12 +2,17 @@ use eframe::egui;
 
 const MAX_CANVAS_SIZE: f32 = 640.0;
 const DEFAULT_GRID_SIZE: usize = 16;
-const EXPORT_SCALE: u32 = 16;
+const MIN_ZOOM: f32 = 0.25;
+const MAX_ZOOM: f32 = 32.0;
+const MAX_RECENT_COLORS: usize = 10;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tool {
-    Brush,  //le pinceau actuel
-    Bucket, //le pot de peinture
+    Brush,
+    Bucket,
+    Line,
+    Rect,
+    Circle,
 }
 
 fn preset_palette() -> Vec<egui::Color32> {
@@ -64,274 +69,394 @@ fn main() -> Result<(), eframe::Error> {
 
 struct DrawMePixApp {
     grid: Vec<Vec<egui::Color32>>,
-    grid_size: usize,
+    grid_width: usize,
+    grid_height: usize,
     current_color: egui::Color32,
     preset_palette: Vec<egui::Color32>,
     custom_palette: Vec<egui::Color32>,
     custom_picker: egui::Color32,
     last_status: Option<String>,
     show_new_dialog: bool,
-    new_grid_size_input: usize,
+    new_grid_width_input: usize,
+    new_grid_height_input: usize,
     hovered_cell: Option<(usize, usize)>,
 
-    //Pile des états passés (pour Ctrl+Z)
+    // Historique pour Ctrl+Z / Ctrl+Shift+Z
     history: Vec<Vec<Vec<egui::Color32>>>,
-
-    //Pile des états annulés (pour Ctrl+Y / Cmd+Shift+Z)
     redo_stack: Vec<Vec<Vec<egui::Color32>>>,
 
-    //Pour distinguer le premier clic d'un drag continu
+    // État de tracé
     is_drawing: bool,
+    // Dernière cellule peinte pendant le drag courant : sert à interpoler une ligne
+    // entre 2 frames quand la souris bouge vite (évite les pointillés).
+    last_paint_cell: Option<(usize, usize)>,
 
-    //Pour afficher la grille ou non
     show_grid: bool,
-
     tool: Tool,
-
     mirror_horizontal: bool,
     mirror_vertical: bool,
+    zoom: f32,
+
+    // === Texture cache pour rendu rapide ===
+    // Au lieu de dessiner W*H rectangles par frame, on upload la grille
+    // une seule fois sur le GPU et on la dessine comme un quad texturé.
+    canvas_texture: Option<egui::TextureHandle>,
+    // True = la grille a changé, faut régénérer la texture au prochain rendu.
+    texture_dirty: bool,
+
+    brush_size: usize,
+
+    recent_colors: Vec<egui::Color32>,
+
+    dark_mode: bool,
+
+    shape_start: Option<(usize, usize)>,
 }
 
 impl Default for DrawMePixApp {
     fn default() -> Self {
         Self {
             grid: vec![vec![egui::Color32::WHITE; DEFAULT_GRID_SIZE]; DEFAULT_GRID_SIZE],
-            grid_size: DEFAULT_GRID_SIZE,
+            grid_width: DEFAULT_GRID_SIZE,
+            grid_height: DEFAULT_GRID_SIZE,
             current_color: egui::Color32::BLACK,
             preset_palette: preset_palette(),
             custom_palette: Vec::new(),
             custom_picker: egui::Color32::from_rgb(255, 50, 50),
             last_status: None,
             show_new_dialog: false,
-            new_grid_size_input: 16,
             hovered_cell: None,
             history: Vec::new(),
             redo_stack: Vec::new(),
             is_drawing: false,
-            show_grid: true, //Grille visible au démarrage.
+            last_paint_cell: None,
+            show_grid: true,
             tool: Tool::Brush,
             mirror_horizontal: false,
             mirror_vertical: false,
+            zoom: 1.0,
+            new_grid_width_input: DEFAULT_GRID_SIZE,
+            new_grid_height_input: DEFAULT_GRID_SIZE,
+            canvas_texture: None,
+            texture_dirty: true,
+            brush_size: 1,
+            recent_colors: Vec::new(),
+            dark_mode: true,
+            shape_start: None,
         }
     }
 }
 
 impl DrawMePixApp {
-    fn create_new_canvas(&mut self, size: usize) {
+    fn create_new_canvas(&mut self, width: usize, height: usize) {
         self.push_history();
-        self.grid_size = size.clamp(4, 128);
-        self.grid = vec![vec![egui::Color32::WHITE; self.grid_size]; self.grid_size];
+        self.grid_width = width.clamp(4, 4096);
+        self.grid_height = height.clamp(4, 4096);
+        self.grid = Self::fresh_grid(self.grid_width, self.grid_height);
+        self.zoom = 1.0;
+        self.hovered_cell = None;
+        self.texture_dirty = true;
         self.last_status = Some(format!(
             "Nouveau canvas {}×{}",
-            self.grid_size, self.grid_size
+            self.grid_width, self.grid_height
         ));
     }
 
     fn clear_canvas(&mut self) {
         self.push_history();
-        self.grid = vec![vec![egui::Color32::WHITE; self.grid_size]; self.grid_size];
+        self.grid = Self::fresh_grid(self.grid_width, self.grid_height);
+        self.texture_dirty = true;
         self.last_status = Some("Canvas effacé".to_string());
     }
 
-    fn save_png(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("PNG image", &["png"])
-            .set_file_name("drawing.png")
-            .save_file()
-        else {
-            return;
-        };
-
-        let width = self.grid_size as u32 * EXPORT_SCALE;
-        let height = self.grid_size as u32 * EXPORT_SCALE;
-        let mut img = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::new(width, height);
-
-        for y in 0..self.grid_size {
-            for x in 0..self.grid_size {
+    fn save_png(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        let w = self.grid_width as u32;
+        let h = self.grid_height as u32;
+        let mut img = image::RgbaImage::new(w, h);
+        for y in 0..self.grid_height {
+            for x in 0..self.grid_width {
                 let c = self.grid[y][x];
-                let pixel = image::Rgba([c.r(), c.g(), c.b(), c.a()]);
-                for dy in 0..EXPORT_SCALE {
-                    for dx in 0..EXPORT_SCALE {
-                        img.put_pixel(
-                            x as u32 * EXPORT_SCALE + dx,
-                            y as u32 * EXPORT_SCALE + dy,
-                            pixel,
-                        );
-                    }
+                img.put_pixel(
+                    x as u32,
+                    y as u32,
+                    image::Rgba([c.r(), c.g(), c.b(), c.a()]),
+                );
+            }
+        }
+        img.save(path)?;
+        Ok(())
+    }
+
+    fn paint_brush(&mut self, cx: usize, cy: usize, color: egui::Color32) {
+        // cx, cy = centre du pinceau.
+        // On peint un carré de brush_size x brush_size autour de ce centre.
+        let half = self.brush_size as isize / 2;
+        let size = self.brush_size as isize;
+        for dy in 0..size {
+            for dx in 0..size {
+                let x = cx as isize + dx - half;
+                let y = cy as isize + dy - half;
+                if x >= 0 && y >= 0 {
+                    self.paint_pixel(x as usize, y as usize, color);
                 }
             }
         }
-
-        match img.save(&path) {
-            Ok(_) => self.last_status = Some(format!("Sauvegardé : {}", path.display())),
-            Err(e) => self.last_status = Some(format!("Erreur : {}", e)),
-        }
     }
 
-    //Remplit toute la zone connectée à (start_x, start_y) qui a la
-    //même couleur que le pixel de départ, en remplaçant par target_color.
-    fn flood_fill(&mut self, start_x: usize, start_y: usize, target_color: egui::Color32) {
-        //Borne de sécurité : si on clique en dehors de la grille, on quitte.
-        if start_x >= self.grid_size || start_y >= self.grid_size {
-            return;
-        }
-
+    fn flood_fill(&mut self, start_x: usize, start_y: usize, new_color: egui::Color32) {
         let source_color = self.grid[start_y][start_x];
-
-        //Cas trivial : la zone est déjà de la bonne couleur, rien à faire.
-        //C'est aussi une protection essentielle : sinon l'algo boucle à l'infini.
-        if source_color == target_color {
+        if source_color == new_color {
             return;
         }
 
-        //VecDeque c'est une fille (queue) à double extrémité, idéale pour le BFS.
-        //On la remplit par derrière, on la vide par devant.
         let mut queue = std::collections::VecDeque::new();
         queue.push_back((start_x, start_y));
 
         while let Some((x, y)) = queue.pop_front() {
-            //On vérifie que le pixel est toujours de la couleur source.
-            //Important : un pixel peut être ajouté plusieurs fois à la queue
-            //par ses voisins, on évite de le retraiter.
             if self.grid[y][x] != source_color {
                 continue;
             }
+            self.grid[y][x] = new_color;
 
-            //On remplit ce pixel.
-            self.grid[y][x] = target_color;
-
-            //On ajoute les 4 voisins cardinaux à la queue.
-            //L'algo classique du flood fill 4-connecté.
             if x > 0 {
                 queue.push_back((x - 1, y));
             }
-            if x + 1 < self.grid_size {
+            if x < self.grid_width - 1 {
                 queue.push_back((x + 1, y));
             }
             if y > 0 {
                 queue.push_back((x, y - 1));
             }
-            if y + 1 < self.grid_size {
+            if y < self.grid_height - 1 {
                 queue.push_back((x, y + 1));
             }
         }
+        self.texture_dirty = true;
     }
 
-    fn load_png(&mut self) {
-        //Étape 1 : demander un fichier à ouvrir
-        let Some(path) = rfd::FileDialog::new()
-        .add_filter("Image", &["png", "jpg", "jpeg", "bmp", "gif"])
-        .pick_file()
-        else {
-            return;
-        };
-    
+    fn load_png(&mut self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        let img = image::open(path)?.to_rgba8();
+        let w = img.width() as usize;
+        let h = img.height() as usize;
 
-    //Étape 2 : ouvrir et lire l'image. Le ? propage l'erreur s'il y en a une,
-    //mais comme on n'est pas dans une fonction qui retourne Result,
-    //on utilise un match explicite.
-    let img = match image::open(&path) {
-            Ok(img) => img.to_rgba8(),
-            Err(e) => {
-                self.last_status = Some(format!("Erreur ouverture : {}", e));
-                return;
-            }
-        };
-
-        let (w, h) = (img.width(), img.height());
-
-        // Étape 3 : sauvegarder l'état actuel dans l'historique avant de tout écraser
-        self.push_history();
-
-        // Étape 4 : reconstituer la grille en sous-échantillonnant l'image.
-        // On parcourt chaque cellule de la nouvelle grille et on prend la couleur
-        // du pixel correspondant au centre du bloc.
-        let mut new_grid = vec![vec![egui::Color32::WHITE; self.grid_size]; self.grid_size];
-        for y in 0..self.grid_size {
-            for x in 0..self.grid_size {
-                // Position du centre de la cellule dans l'image source
-                let src_x = (x as u32 * w / self.grid_size as u32).min(w - 1);
-                let src_y = (y as u32 * h / self.grid_size as u32).min(h - 1);
-                let pixel = img.get_pixel(src_x, src_y);
-                new_grid[y][x] = egui::Color32::from_rgba_unmultiplied(
-                    pixel[0], pixel[1], pixel[2], pixel[3],
-                );
+        let mut new_grid = vec![vec![egui::Color32::WHITE; w]; h];
+        for y in 0..h {
+            for x in 0..w {
+                let p = img.get_pixel(x as u32, y as u32);
+                new_grid[y][x] = egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]);
             }
         }
 
-    self.grid = new_grid;
-    self.last_status = Some(format!("Importé : {}", path.display()));
-}
+        self.grid_width = w;
+        self.grid_height = h;
+        self.grid = new_grid;
+        self.history.clear();
+        self.redo_stack.clear();
+        self.zoom = 1.0;
+        self.hovered_cell = None;
+        self.texture_dirty = true;
+        Ok(())
+    }
 
-    fn paint_pixel(&mut self, x:usize, y:usize, color: egui::Color32) {
-        if x >= self.grid_size || y >= self.grid_size {
-            return;
-        }
-
-        //Pixel principal
+    fn paint_pixel(&mut self, x: usize, y: usize, color: egui::Color32) {
         self.grid[y][x] = color;
-
-        //Calcul des données miroir
-        let mx = self.grid_size - 1 - x;
-        let my = self.grid_size - 1 - y;
-
-        //Miroir horizontal : on dessine aussi à droite (symétrie gauche droite)
         if self.mirror_horizontal {
+            let mx = self.grid_width - 1 - x;
             self.grid[y][mx] = color;
         }
-
-        //Miroir vertical : on dessine aussi en bas (symétrie haut-bas)
         if self.mirror_vertical {
+            let my = self.grid_height - 1 - y;
             self.grid[my][x] = color;
         }
-
-        //Si les deux miroirs sont actifs : symétrie centrale (4 pixels d'un coup)
         if self.mirror_horizontal && self.mirror_vertical {
+            let mx = self.grid_width - 1 - x;
+            let my = self.grid_height - 1 - y;
             self.grid[my][mx] = color;
+        }
+        self.texture_dirty = true;
+    }
+
+    // Trace une ligne de pixels entre 2 cellules en utilisant Bresenham.
+    // Sert à combler les "trous" quand la souris bouge plus vite qu'un frame.
+    fn paint_line(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, color: egui::Color32) {
+        let (mut x0, mut y0) = (x0 as i32, y0 as i32);
+        let (x1, y1) = (x1 as i32, y1 as i32);
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+
+        loop {
+            if x0 >= 0
+                && y0 >= 0
+                && (x0 as usize) < self.grid_width
+                && (y0 as usize) < self.grid_height
+            {
+                self.paint_pixel(x0 as usize, y0 as usize, color);
+            }
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x0 += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y0 += sy;
+            }
         }
     }
 
-//Sauvegarde l'état actuel du canvas dans l'historique.
-    //À appeler AVANT chaque modification
     fn push_history(&mut self) {
-        //On clone la grille actuelle (deep copy) et on l'empile.
         self.history.push(self.grid.clone());
-
-        //Toute nouvelle action invalide la pile de redo : si je peins
-        //après avoir annulé, je ne peux plus "rétablir" l'ancienne action.
         self.redo_stack.clear();
-
-        //On limite la taille de l'historique pour éviter de bouffer
-        //toute la RAM. 100 entrée = largement assez.
         if self.history.len() > 100 {
             self.history.remove(0);
         }
     }
 
-    //Annule la dernière action : restaure l'avant-dernier état.
     fn undo(&mut self) {
         if let Some(previous) = self.history.pop() {
-            //L'état actuel devient un état "annulé" : on le pousse dans redo
-            //pour pouvoir le rétablir avec Ctrl+Y plus tard.
             self.redo_stack.push(self.grid.clone());
             self.grid = previous;
+            self.texture_dirty = true;
         }
     }
 
-    //Rétablit une action précédemment annulée.
     fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
-            //Symétrique de undo : on archive l'état actuel avant de
-            //restaurer celui qu'on avait annulé.
             self.history.push(self.grid.clone());
             self.grid = next;
+            self.texture_dirty = true;
+        }
+    }
+
+    fn fresh_grid(width: usize, height: usize) -> Vec<Vec<egui::Color32>> {
+        vec![vec![egui::Color32::WHITE; width]; height]
+    }
+
+    // Reconstruit la texture GPU à partir de la grille. Appelé seulement quand
+    // texture_dirty == true, donc une fois par modif et pas par frame.
+    fn rebuild_canvas_texture(&mut self, ctx: &egui::Context) {
+        let mut pixels = Vec::with_capacity(self.grid_width * self.grid_height);
+        for y in 0..self.grid_height {
+            for x in 0..self.grid_width {
+                pixels.push(self.grid[y][x]);
+            }
+        }
+
+        let image = egui::ColorImage {
+            size: [self.grid_width, self.grid_height],
+            pixels,
+        };
+
+        // NEAREST = pas d'interpolation = pixels nets quand on zoome.
+        self.canvas_texture =
+            Some(ctx.load_texture("drawmepix_canvas", image, egui::TextureOptions::NEAREST));
+        self.texture_dirty = false;
+    }
+
+    fn remember_color(&mut self, color: egui::Color32) {
+        // Si la couleur est déjà dans la liste, on la retire avant de la
+        // remettre en tête : la couleur la plus récente reste toujours à gauche.
+        self.recent_colors.retain(|c| *c != color);
+        self.recent_colors.insert(0, color);
+        if self.recent_colors.len() > MAX_RECENT_COLORS {
+            self.recent_colors.truncate(MAX_RECENT_COLORS);
+        }
+    }
+
+    fn draw_line(&mut self, x0: isize, y0: isize, x1: isize, y1: isize, color: egui::Color32) {
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        let mut x = x0;
+        let mut y = y0;
+        loop {
+            if x >= 0 && y >= 0 {
+                self.paint_pixel(x as usize, y as usize, color);
+            }
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+    }
+
+    // Dessine un rectangle vide (contour seulement).
+    fn draw_rect(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, color: egui::Color32) {
+        let (x_min, x_max) = if x0 < x1 { (x0, x1) } else { (x1, x0) };
+        let (y_min, y_max) = if y0 < y1 { (y0, y1) } else { (y1, y0) };
+        // Lignes horizontales (haut + bas)
+        for x in x_min..=x_max {
+            self.paint_pixel(x, y_min, color);
+            self.paint_pixel(x, y_max, color);
+        }
+        // Lignes verticales (gauche + droite)
+        for y in y_min..=y_max {
+            self.paint_pixel(x_min, y, color);
+            self.paint_pixel(x_max, y, color);
+        }
+    }
+
+    // Dessine un cercle (contour) via l'algo du midpoint circle.
+    fn draw_circle(&mut self, cx: usize, cy: usize, r: usize, color: egui::Color32) {
+        let r = r as isize;
+        let cx = cx as isize;
+        let cy = cy as isize;
+        let mut x: isize = 0;
+        let mut y = r;
+        // Variable de décision du midpoint circle : son signe indique
+        // s'il faut descendre d'un cran en y ou non.
+        let mut d = 1 - r;
+        while x <= y {
+            // On peint les 8 octants d'un coup grâce à la symétrie du cercle.
+            for (px, py) in [
+                (cx + x, cy + y), (cx - x, cy + y),
+                (cx + x, cy - y), (cx - x, cy - y),
+                (cx + y, cy + x), (cx - y, cy + x),
+                (cx + y, cy - x), (cx - y, cy - x),
+            ] {
+                if px >= 0 && py >= 0 {
+                    self.paint_pixel(px as usize, py as usize, color);
+                }
+            }
+            if d < 0 {
+                d += 2 * x + 3;
+            } else {
+                d += 2 * (x - y) + 5;
+                y -= 1;
+            }
+            x += 1;
         }
     }
 }
 
 impl eframe::App for DrawMePixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // === Raccourcis clavier (à traiter en premier) ===
+        // Applique le thème (clair / sombre) selon le réglage courant.
+        if self.dark_mode {
+            ctx.set_visuals(egui::Visuals::dark());
+        } else {
+            ctx.set_visuals(egui::Visuals::light());
+        }
+        // === Désactive le zoom natif d'egui sur Cmd+/- ===
+        ctx.options_mut(|opts| opts.zoom_with_keyboard = false);
+
+        // === Raccourcis clavier ===
         ctx.input(|i| {
             if i.modifiers.command && i.key_pressed(egui::Key::Z) {
                 if i.modifiers.shift {
@@ -343,12 +468,33 @@ impl eframe::App for DrawMePixApp {
             if i.modifiers.command && i.key_pressed(egui::Key::Y) {
                 self.redo();
             }
-        });
-        ctx.input(|i| {
             if i.key_pressed(egui::Key::G) {
                 self.show_grid = !self.show_grid;
             }
+            // Cmd + = (et donc Cmd + Shift + + sur AZERTY) → zoom in
+            if i.modifiers.command && i.key_pressed(egui::Key::Equals) {
+                self.zoom = (self.zoom * 1.25).min(MAX_ZOOM);
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::Minus) {
+                self.zoom = (self.zoom / 1.25).max(MIN_ZOOM);
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::Num0) {
+                self.zoom = 1.0;
+            }
         });
+
+        // === Zoom au pinch trackpad (gesture naturel macOS) ===
+        let zoom_delta = ctx.input(|i| i.zoom_delta());
+        if (zoom_delta - 1.0).abs() > 0.001 {
+            self.zoom = (self.zoom * zoom_delta).clamp(MIN_ZOOM, MAX_ZOOM);
+        }
+
+        // === Zoom au Cmd + molette (souris) ===
+        let (cmd_down, scroll_y) = ctx.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
+        if cmd_down && scroll_y.abs() > 0.1 {
+            let factor = (scroll_y * 0.005).exp();
+            self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        }
 
         // === Barre de menu en haut ===
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -356,15 +502,31 @@ impl eframe::App for DrawMePixApp {
                 ui.menu_button("Fichier", |ui| {
                     if ui.button("Nouveau canvas…").clicked() {
                         self.show_new_dialog = true;
-                        self.new_grid_size_input = self.grid_size;
+                        self.new_grid_width_input = self.grid_width;
+                        self.new_grid_height_input = self.grid_height;
                         ui.close_menu();
                     }
                     if ui.button("Ouvrir...").clicked() {
-                        self.load_png();
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Images PNG", &["png"])
+                            .pick_file()
+                        {
+                            if let Err(e) = self.load_png(&path) {
+                                eprintln!("Erreur de chargement : {}", e);
+                            }
+                        }
                         ui.close_menu();
                     }
                     if ui.button("Sauvegarder en PNG…").clicked() {
-                        self.save_png();
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Images PNG", &["png"])
+                            .set_file_name("pixel_art.png")
+                            .save_file()
+                        {
+                            if let Err(e) = self.save_png(&path) {
+                                eprintln!("Erreur de sauvegarde : {}", e);
+                            }
+                        }
                         ui.close_menu();
                     }
                     ui.separator();
@@ -374,12 +536,20 @@ impl eframe::App for DrawMePixApp {
                 });
 
                 ui.menu_button("Affichage", |ui| {
-                    //ui.checkbox crée une case à cocher liée directement à un booléen.
-                    //L'utilisateur clique, ça toggle, on relit la valeur au prochain frame.
                     ui.checkbox(&mut self.show_grid, "Afficher la grille");
                     ui.separator();
-                    ui.checkbox(&mut self.mirror_horizontal, "Mirroir horizontal");
-                    ui.checkbox(&mut self.mirror_vertical, "Mirroir Vertical");
+                    ui.checkbox(&mut self.mirror_horizontal, "Miroir horizontal");
+                    ui.checkbox(&mut self.mirror_vertical, "Miroir vertical");
+                    ui.separator();
+                    if ui.button("Zoom +").clicked() {
+                        self.zoom = (self.zoom * 1.25).min(MAX_ZOOM);
+                    }
+                    if ui.button("Zoom -").clicked() {
+                        self.zoom = (self.zoom / 1.25).max(MIN_ZOOM);
+                    }
+                    if ui.button("Réinitialiser zoom").clicked() {
+                        self.zoom = 1.0;
+                    }
                 });
 
                 ui.menu_button("Édition", |ui| {
@@ -411,7 +581,14 @@ impl eframe::App for DrawMePixApp {
                 });
 
                 ui.separator();
-                ui.label(format!("Grille : {0}×{0}", self.grid_size));
+                ui.checkbox(&mut self.dark_mode, "Mode sombre");
+
+                // === Infos à droite ===
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(format!("Zoom : {:.0} %", self.zoom * 100.0));
+                    ui.separator();
+                    ui.label(format!("Canvas : {}×{}", self.grid_width, self.grid_height));
+                });
             });
         });
 
@@ -439,6 +616,8 @@ impl eframe::App for DrawMePixApp {
                 if let Some(status) = &self.last_status {
                     ui.label(status);
                 }
+                ui.separator();
+                ui.label(format!("Zoom : {:.0} %", self.zoom * 100.0));
             });
         });
 
@@ -453,19 +632,23 @@ impl eframe::App for DrawMePixApp {
                 egui::Grid::new("preset_grid")
                     .spacing([4.0, 4.0])
                     .show(ui, |ui| {
-                        for (i, color) in self.preset_palette.iter().enumerate() {
-                            let is_selected = *color == self.current_color;
+                        for i in 0..self.preset_palette.len() {
+                            // On copie la couleur pour ne pas garder d'emprunt
+                            // sur self.preset_palette pendant qu'on modifie self.
+                            let color = self.preset_palette[i];
+                            let is_selected = color == self.current_color;
                             let stroke = if is_selected {
                                 egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 200, 0))
                             } else {
                                 egui::Stroke::new(1.0, egui::Color32::from_gray(120))
                             };
                             let button = egui::Button::new("")
-                                .fill(*color)
+                                .fill(color)
                                 .min_size(egui::vec2(28.0, 28.0))
                                 .stroke(stroke);
                             if ui.add(button).clicked() {
-                                self.current_color = *color;
+                                self.current_color = color;
+                                self.remember_color(color);
                             }
                             if (i + 1) % 5 == 0 {
                                 ui.end_row();
@@ -480,6 +663,7 @@ impl eframe::App for DrawMePixApp {
                     ui.color_edit_button_srgba(&mut self.custom_picker);
                     if ui.button("Sélectionner").clicked() {
                         self.current_color = self.custom_picker;
+                        self.remember_color(self.custom_picker);
                     }
                 });
                 if ui.button("Ajouter à ma palette").clicked() {
@@ -495,8 +679,9 @@ impl eframe::App for DrawMePixApp {
                     egui::Grid::new("custom_grid")
                         .spacing([4.0, 4.0])
                         .show(ui, |ui| {
-                            for (i, color) in self.custom_palette.iter().enumerate() {
-                                let is_selected = *color == self.current_color;
+                            for i in 0..self.custom_palette.len() {
+                                let color = self.custom_palette[i];
+                                let is_selected = color == self.current_color;
                                 let stroke = if is_selected {
                                     egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 200, 0))
                                 } else {
@@ -504,12 +689,13 @@ impl eframe::App for DrawMePixApp {
                                 };
                                 let resp = ui.add(
                                     egui::Button::new("")
-                                        .fill(*color)
+                                        .fill(color)
                                         .min_size(egui::vec2(28.0, 28.0))
                                         .stroke(stroke),
                                 );
                                 if resp.clicked() {
-                                    self.current_color = *color;
+                                    self.current_color = color;
+                                    self.remember_color(color);
                                 }
                                 if resp.secondary_clicked() {
                                     to_remove = Some(i);
@@ -525,11 +711,62 @@ impl eframe::App for DrawMePixApp {
                     ui.small("Clic droit pour retirer une couleur");
                 }
 
+                if !self.recent_colors.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label("Récentes :");
+                    let mut clicked_color: Option<egui::Color32> = None;
+                    egui::Grid::new("recent_grid")
+                        .spacing([4.0, 4.0])
+                        .show(ui, |ui| {
+                            for (i, color) in self.recent_colors.iter().enumerate() {
+                                let is_selected = *color == self.current_color;
+                                let stroke = if is_selected {
+                                    egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 200, 0))
+                                } else {
+                                    egui::Stroke::new(1.0, egui::Color32::from_gray(120))
+                                };
+                                if ui
+                                    .add(
+                                        egui::Button::new("")
+                                            .fill(*color)
+                                            .min_size(egui::vec2(28.0, 28.0))
+                                            .stroke(stroke),
+                                    )
+                                    .clicked()
+                                {
+                                    clicked_color = Some(*color);
+                                }
+                                if (i + 1) % 5 == 0 {
+                                    ui.end_row();
+                                }
+                            }
+                        });
+                    if let Some(c) = clicked_color {
+                        self.current_color = c;
+                        self.remember_color(c);
+                    }
+                }
+
                 ui.separator();
                 ui.label("Outil");
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.tool, Tool::Brush, "Pinceau");
-                    ui.selectable_value(&mut self.tool, Tool::Bucket, "Pot")
+                    ui.selectable_value(&mut self.tool, Tool::Bucket, "Pot");
+                });
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.tool, Tool::Line, "Ligne");
+                    ui.selectable_value(&mut self.tool, Tool::Rect, "Carré");
+                    ui.selectable_value(&mut self.tool, Tool::Circle, "Cercle");
+                });
+                ui.separator();
+                ui.label("Taille du pinceau");
+                ui.add(egui::Slider::new(&mut self.brush_size, 1..=20).suffix(" px"));
+                ui.horizontal(|ui| {
+                    for size in [1, 2, 4, 8, 16] {
+                        if ui.small_button(format!("{}", size)).clicked() {
+                            self.brush_size = size;
+                        }
+                    }
                 })
             });
 
@@ -543,14 +780,27 @@ impl eframe::App for DrawMePixApp {
                 .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
                 .open(&mut keep_open)
                 .show(ctx, |ui| {
-                    ui.label("Taille de la grille :");
-                    ui.add(
-                        egui::Slider::new(&mut self.new_grid_size_input, 4..=128).text("pixels"),
-                    );
-                    ui.horizontal(|ui| {
-                        for preset in [8, 16, 32, 64, 128] {
-                            if ui.button(format!("{0}×{0}", preset)).clicked() {
-                                self.new_grid_size_input = preset;
+                    ui.label("Largeur :");
+                    ui.add(egui::Slider::new(&mut self.new_grid_width_input, 4..=4096));
+                    ui.label("Hauteur :");
+                    ui.add(egui::Slider::new(&mut self.new_grid_height_input, 4..=4096));
+
+                    ui.separator();
+                    ui.label("Presets :");
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, w, h) in [
+                            ("16×16", 16, 16),
+                            ("32×32", 32, 32),
+                            ("64×64", 64, 64),
+                            ("128×128", 128, 128),
+                            ("256×256", 256, 256),
+                            ("512×512", 512, 512),
+                            ("HD 1280×720", 1280, 720),
+                            ("Full HD 1920×1080", 1920, 1080),
+                        ] {
+                            if ui.button(label).clicked() {
+                                self.new_grid_width_input = w;
+                                self.new_grid_height_input = h;
                             }
                         }
                     });
@@ -564,110 +814,195 @@ impl eframe::App for DrawMePixApp {
                         }
                     });
                 });
-            if !keep_open {
+            if create_now {
+                self.create_new_canvas(self.new_grid_width_input, self.new_grid_height_input);
                 self.show_new_dialog = false;
             }
-            if create_now {
-                self.create_new_canvas(self.new_grid_size_input);
+            if !keep_open {
                 self.show_new_dialog = false;
             }
         }
 
         // === Zone centrale : canvas ===
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                let pixel_size = (MAX_CANVAS_SIZE / self.grid_size as f32).floor();
-                let canvas_size = egui::vec2(
-                    self.grid_size as f32 * pixel_size,
-                    self.grid_size as f32 * pixel_size,
-                );
-                let (response, painter) =
-                    ui.allocate_painter(canvas_size, egui::Sense::click_and_drag());
-                let canvas_rect = response.rect;
+            egui::ScrollArea::both()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    let max_dim = self.grid_width.max(self.grid_height) as f32;
+                    let base_pixel_size = (MAX_CANVAS_SIZE / max_dim).floor().max(1.0);
+                    let pixel_size = (base_pixel_size * self.zoom).max(1.0);
 
-                for y in 0..self.grid_size {
-                    for x in 0..self.grid_size {
-                        let pixel_pos = canvas_rect.min
-                            + egui::vec2(x as f32 * pixel_size, y as f32 * pixel_size);
-                        let pixel_rect = egui::Rect::from_min_size(
-                            pixel_pos,
-                            egui::vec2(pixel_size, pixel_size),
+                    let canvas_size = egui::vec2(
+                        self.grid_width as f32 * pixel_size,
+                        self.grid_height as f32 * pixel_size,
+                    );
+                    let (response, painter) =
+                        ui.allocate_painter(canvas_size, egui::Sense::click_and_drag());
+                    let canvas_rect = response.rect;
+
+                    // === 1. Rendu rapide : on régénère la texture si la grille a changé,
+                    // puis on la dessine en UN SEUL appel quel que soit la taille du canvas.
+                    if self.texture_dirty || self.canvas_texture.is_none() {
+                        self.rebuild_canvas_texture(ctx);
+                    }
+                    if let Some(tex) = &self.canvas_texture {
+                        painter.image(
+                            tex.id(),
+                            canvas_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
                         );
-                        painter.rect_filled(pixel_rect, 0.0, self.grid[y][x]);
-                        if self.show_grid && pixel_size > 6.0 {
-                            painter.rect_stroke(
-                                pixel_rect,
-                                0.0,
-                                egui::Stroke::new(0.5, egui::Color32::from_gray(220)),
-                            );
+                    }
+
+                    // === 2. Grille (lignes fines) : seulement quand on est zoomé assez,
+                    // et seulement sur les cellules effectivement visibles à l'écran.
+                    if self.show_grid && pixel_size > 6.0 {
+                        let visible = ui.clip_rect();
+                        let sx = (((visible.min.x - canvas_rect.min.x) / pixel_size).floor() as i32)
+                            .max(0) as usize;
+                        let sy = (((visible.min.y - canvas_rect.min.y) / pixel_size).floor() as i32)
+                            .max(0) as usize;
+                        let ex = (((visible.max.x - canvas_rect.min.x) / pixel_size).ceil() as i32)
+                            .max(0) as usize;
+                        let ey = (((visible.max.y - canvas_rect.min.y) / pixel_size).ceil() as i32)
+                            .max(0) as usize;
+                        let ex = ex.min(self.grid_width);
+                        let ey = ey.min(self.grid_height);
+
+                        let stroke = egui::Stroke::new(0.5, egui::Color32::from_gray(220));
+                        for y in sy..ey {
+                            for x in sx..ex {
+                                let p = canvas_rect.min
+                                    + egui::vec2(x as f32 * pixel_size, y as f32 * pixel_size);
+                                let r = egui::Rect::from_min_size(
+                                    p,
+                                    egui::vec2(pixel_size, pixel_size),
+                                );
+                                painter.rect_stroke(r, 0.0, stroke);
+                            }
                         }
                     }
-                }
 
-                self.hovered_cell = response.hover_pos().and_then(|pos| {
-                    let rel = pos - canvas_rect.min;
-                    let x = (rel.x / pixel_size) as usize;
-                    let y = (rel.y / pixel_size) as usize;
-                    if x < self.grid_size && y < self.grid_size {
-                        Some((x, y))
-                    } else {
-                        None
-                    }
-                });
-
-                if response.is_pointer_button_down_on() {
-                    if let Some(pos) = response.interact_pointer_pos() {
+                    // === 3. Hover detection ===
+                    self.hovered_cell = response.hover_pos().and_then(|pos| {
                         let rel = pos - canvas_rect.min;
                         let x = (rel.x / pixel_size) as usize;
                         let y = (rel.y / pixel_size) as usize;
-                        if x < self.grid_size && y < self.grid_size {
-                            // On lit l'état des touches modificatrices.
-                            // En egui, ces booléens sont true tant que la touche est pressée.
-                            let alt_pressed = ctx.input(|i| i.modifiers.alt);
-                            let right_pressed = ctx.input(|i| i.pointer.secondary_down());
+                        if x < self.grid_width && y < self.grid_height {
+                            Some((x, y))
+                        } else {
+                            None
+                        }
+                    });
 
-                            if alt_pressed {
-                                // Mode pipette : on récupère la couleur du pixel
-                                // au lieu de peindre. On ne modifie PAS la grille.
-                                self.current_color = self.grid[y][x];
-                            } else {
-                                // Couleur à appliquer : blanche si clic droit (gomme),
-                                // sinon la couleur active.
+                    // === 4. Pan / Peinture / Formes géométriques ===
+                    let middle_down = ctx.input(|i| i.pointer.middle_down());
+                    if middle_down {
+                        // Pan avec clic molette (inchangé)
+                        let delta = ctx.input(|i| i.pointer.delta());
+                        ui.scroll_with_delta(-delta);
+                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                        self.is_drawing = false;
+                        self.last_paint_cell = None;
+                    } else {
+                        // On détecte les transitions de drag pour les formes géométriques :
+                        // - drag_started : la souris vient juste d'être enfoncée et bouge
+                        // - drag_released : la souris vient juste d'être relâchée
+                        let drag_started = response.drag_started();
+                        let drag_released = response.drag_stopped();
+                        let pressed = response.is_pointer_button_down_on();
+
+                        if let Some(pos) = response.interact_pointer_pos() {
+                            let rel = pos - canvas_rect.min;
+                            let cx = (rel.x / pixel_size) as usize;
+                            let cy = (rel.y / pixel_size) as usize;
+
+                            if cx < self.grid_width && cy < self.grid_height {
+                                let alt_pressed = ctx.input(|i| i.modifiers.alt);
+                                let right_pressed = ctx.input(|i| i.pointer.secondary_down());
                                 let color = if right_pressed {
                                     egui::Color32::WHITE
                                 } else {
                                     self.current_color
                                 };
 
-                                // Aiguillage selon l'outil sélectionné
-                                match self.tool {
-                                    Tool::Brush => {
-                                        // Début d'un nouveau trait, on snapshot l'historique
-                                        // si ce n'est pas déjà fait pendant ce drag.
-                                        if !self.is_drawing {
-                                            self.push_history();
-                                            self.is_drawing = true;
+                                if alt_pressed && pressed {
+                                    // Pipette : récupère la couleur du pixel survolé
+                                    self.current_color = self.grid[cy][cx];
+                                    self.remember_color(self.grid[cy][cx]);
+                                } else {
+                                    match self.tool {
+                                        Tool::Brush => {
+                                            if pressed {
+                                                if !self.is_drawing {
+                                                    self.push_history();
+                                                    self.is_drawing = true;
+                                                    self.last_paint_cell = None;
+                                                }
+                                                // Interpolation : on relie la dernière
+                                                // cellule à la cellule actuelle pour
+                                                // éviter les "trous" sur les drags rapides.
+                                                if let Some((px, py)) = self.last_paint_cell {
+                                                    self.paint_line(px, py, cx, cy, color);
+                                                }
+                                                self.paint_brush(cx, cy, color);
+                                                self.last_paint_cell = Some((cx, cy));
+                                            }
                                         }
-                                        self.paint_pixel(x, y, color);
-                                    }
-                                    Tool::Bucket => {
-                                        // Pot de peinture : on n'agit qu'au premier clic
-                                        // d'un drag, pas pendant tout le mouvement.
-                                        if !self.is_drawing {
-                                            self.push_history();
-                                            self.is_drawing = true;
-                                            self.flood_fill(x, y, color);
+                                        Tool::Bucket => {
+                                            if pressed && !self.is_drawing {
+                                                self.push_history();
+                                                self.is_drawing = true;
+                                                self.flood_fill(cx, cy, color);
+                                            }
+                                        }
+                                        Tool::Line | Tool::Rect | Tool::Circle => {
+                                            // Au DÉBUT du drag : on mémorise l'ancrage
+                                            // et on snapshot l'historique une seule fois.
+                                            if drag_started {
+                                                self.shape_start = Some((cx, cy));
+                                                self.push_history();
+                                            }
+                                            // À la FIN du drag : on commit la forme finale.
+                                            if drag_released {
+                                                if let Some((x0, y0)) = self.shape_start.take() {
+                                                    match self.tool {
+                                                        Tool::Line => self.draw_line(
+                                                            x0 as isize,
+                                                            y0 as isize,
+                                                            cx as isize,
+                                                            cy as isize,
+                                                            color,
+                                                        ),
+                                                        Tool::Rect => {
+                                                            self.draw_rect(x0, y0, cx, cy, color)
+                                                        }
+                                                        Tool::Circle => {
+                                                            // Rayon = distance entre ancrage
+                                                            // et point de relâchement
+                                                            let dx = cx as isize - x0 as isize;
+                                                            let dy = cy as isize - y0 as isize;
+                                                            let r = ((dx * dx + dy * dy) as f32)
+                                                                .sqrt()
+                                                                as usize;
+                                                            self.draw_circle(x0, y0, r, color);
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+
+                        if !pressed {
+                            self.is_drawing = false;
+                            self.last_paint_cell = None;
+                        }
                     }
-                } else {
-                    // Aucun bouton pressé : le trait est terminé, prochain clic = nouveau trait.
-                    self.is_drawing = false;
-                }
-            });
+                });
         });
     }
 }
