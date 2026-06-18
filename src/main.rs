@@ -1,10 +1,11 @@
-use eframe::egui;
+use eframe::egui::{self};
 
 const MAX_CANVAS_SIZE: f32 = 640.0;
 const DEFAULT_GRID_SIZE: usize = 16;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 32.0;
 const MAX_RECENT_COLORS: usize = 10;
+const TRANSPARENT: egui::Color32 = egui::Color32::TRANSPARENT;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tool {
@@ -13,38 +14,32 @@ enum Tool {
     Line,
     Rect,
     Circle,
+    Select,
 }
 
 fn preset_palette() -> Vec<egui::Color32> {
     vec![
-        // Gris
         egui::Color32::BLACK,
         egui::Color32::from_rgb(64, 64, 64),
         egui::Color32::from_rgb(128, 128, 128),
         egui::Color32::from_rgb(192, 192, 192),
-        egui::Color32::WHITE,
-        // Rouges
+        egui::Color32::TRANSPARENT,
         egui::Color32::from_rgb(139, 0, 0),
         egui::Color32::from_rgb(255, 0, 0),
         egui::Color32::from_rgb(255, 105, 105),
-        // Oranges / jaunes
         egui::Color32::from_rgb(255, 140, 0),
         egui::Color32::from_rgb(255, 200, 0),
         egui::Color32::from_rgb(255, 255, 0),
-        // Verts
         egui::Color32::from_rgb(0, 100, 0),
         egui::Color32::from_rgb(0, 200, 0),
         egui::Color32::from_rgb(150, 255, 100),
-        // Bleus
         egui::Color32::from_rgb(0, 0, 139),
         egui::Color32::from_rgb(0, 100, 255),
         egui::Color32::from_rgb(135, 206, 250),
-        // Violets / roses
         egui::Color32::from_rgb(75, 0, 130),
         egui::Color32::from_rgb(150, 50, 200),
         egui::Color32::from_rgb(255, 105, 180),
         egui::Color32::from_rgb(255, 192, 203),
-        // Bruns
         egui::Color32::from_rgb(101, 67, 33),
         egui::Color32::from_rgb(139, 69, 19),
         egui::Color32::from_rgb(210, 180, 140),
@@ -81,14 +76,10 @@ struct DrawMePixApp {
     new_grid_height_input: usize,
     hovered_cell: Option<(usize, usize)>,
 
-    // Historique pour Ctrl+Z / Ctrl+Shift+Z
     history: Vec<Vec<Vec<egui::Color32>>>,
     redo_stack: Vec<Vec<Vec<egui::Color32>>>,
 
-    // État de tracé
     is_drawing: bool,
-    // Dernière cellule peinte pendant le drag courant : sert à interpoler une ligne
-    // entre 2 frames quand la souris bouge vite (évite les pointillés).
     last_paint_cell: Option<(usize, usize)>,
 
     show_grid: bool,
@@ -97,26 +88,23 @@ struct DrawMePixApp {
     mirror_vertical: bool,
     zoom: f32,
 
-    // === Texture cache pour rendu rapide ===
-    // Au lieu de dessiner W*H rectangles par frame, on upload la grille
-    // une seule fois sur le GPU et on la dessine comme un quad texturé.
     canvas_texture: Option<egui::TextureHandle>,
-    // True = la grille a changé, faut régénérer la texture au prochain rendu.
     texture_dirty: bool,
 
     brush_size: usize,
-
     recent_colors: Vec<egui::Color32>,
-
     dark_mode: bool,
 
     shape_start: Option<(usize, usize)>,
+
+    selection: Option<(usize, usize, usize, usize)>,
+    clipboard: Option<Vec<Vec<egui::Color32>>>,
 }
 
 impl Default for DrawMePixApp {
     fn default() -> Self {
         Self {
-            grid: vec![vec![egui::Color32::WHITE; DEFAULT_GRID_SIZE]; DEFAULT_GRID_SIZE],
+            grid: vec![vec![egui::Color32::TRANSPARENT; DEFAULT_GRID_SIZE]; DEFAULT_GRID_SIZE],
             grid_width: DEFAULT_GRID_SIZE,
             grid_height: DEFAULT_GRID_SIZE,
             current_color: egui::Color32::BLACK,
@@ -143,6 +131,8 @@ impl Default for DrawMePixApp {
             recent_colors: Vec::new(),
             dark_mode: true,
             shape_start: None,
+            selection: None,
+            clipboard: None,
         }
     }
 }
@@ -188,8 +178,6 @@ impl DrawMePixApp {
     }
 
     fn paint_brush(&mut self, cx: usize, cy: usize, color: egui::Color32) {
-        // cx, cy = centre du pinceau.
-        // On peint un carré de brush_size x brush_size autour de ce centre.
         let half = self.brush_size as isize / 2;
         let size = self.brush_size as isize;
         for dy in 0..size {
@@ -239,7 +227,7 @@ impl DrawMePixApp {
         let w = img.width() as usize;
         let h = img.height() as usize;
 
-        let mut new_grid = vec![vec![egui::Color32::WHITE; w]; h];
+        let mut new_grid = vec![vec![egui::Color32::TRANSPARENT; w]; h];
         for y in 0..h {
             for x in 0..w {
                 let p = img.get_pixel(x as u32, y as u32);
@@ -276,8 +264,6 @@ impl DrawMePixApp {
         self.texture_dirty = true;
     }
 
-    // Trace une ligne de pixels entre 2 cellules en utilisant Bresenham.
-    // Sert à combler les "trous" quand la souris bouge plus vite qu'un frame.
     fn paint_line(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, color: egui::Color32) {
         let (mut x0, mut y0) = (x0 as i32, y0 as i32);
         let (x1, y1) = (x1 as i32, y1 as i32);
@@ -335,11 +321,9 @@ impl DrawMePixApp {
     }
 
     fn fresh_grid(width: usize, height: usize) -> Vec<Vec<egui::Color32>> {
-        vec![vec![egui::Color32::WHITE; width]; height]
+        vec![vec![egui::Color32::TRANSPARENT; width]; height]  // ← TRANSPARENT au lieu de WHITE
     }
 
-    // Reconstruit la texture GPU à partir de la grille. Appelé seulement quand
-    // texture_dirty == true, donc une fois par modif et pas par frame.
     fn rebuild_canvas_texture(&mut self, ctx: &egui::Context) {
         let mut pixels = Vec::with_capacity(self.grid_width * self.grid_height);
         for y in 0..self.grid_height {
@@ -353,15 +337,12 @@ impl DrawMePixApp {
             pixels,
         };
 
-        // NEAREST = pas d'interpolation = pixels nets quand on zoome.
         self.canvas_texture =
             Some(ctx.load_texture("drawmepix_canvas", image, egui::TextureOptions::NEAREST));
         self.texture_dirty = false;
     }
 
     fn remember_color(&mut self, color: egui::Color32) {
-        // Si la couleur est déjà dans la liste, on la retire avant de la
-        // remettre en tête : la couleur la plus récente reste toujours à gauche.
         self.recent_colors.retain(|c| *c != color);
         self.recent_colors.insert(0, color);
         if self.recent_colors.len() > MAX_RECENT_COLORS {
@@ -396,39 +377,36 @@ impl DrawMePixApp {
         }
     }
 
-    // Dessine un rectangle vide (contour seulement).
     fn draw_rect(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, color: egui::Color32) {
         let (x_min, x_max) = if x0 < x1 { (x0, x1) } else { (x1, x0) };
         let (y_min, y_max) = if y0 < y1 { (y0, y1) } else { (y1, y0) };
-        // Lignes horizontales (haut + bas)
         for x in x_min..=x_max {
             self.paint_pixel(x, y_min, color);
             self.paint_pixel(x, y_max, color);
         }
-        // Lignes verticales (gauche + droite)
         for y in y_min..=y_max {
             self.paint_pixel(x_min, y, color);
             self.paint_pixel(x_max, y, color);
         }
     }
 
-    // Dessine un cercle (contour) via l'algo du midpoint circle.
     fn draw_circle(&mut self, cx: usize, cy: usize, r: usize, color: egui::Color32) {
         let r = r as isize;
         let cx = cx as isize;
         let cy = cy as isize;
         let mut x: isize = 0;
         let mut y = r;
-        // Variable de décision du midpoint circle : son signe indique
-        // s'il faut descendre d'un cran en y ou non.
         let mut d = 1 - r;
         while x <= y {
-            // On peint les 8 octants d'un coup grâce à la symétrie du cercle.
             for (px, py) in [
-                (cx + x, cy + y), (cx - x, cy + y),
-                (cx + x, cy - y), (cx - x, cy - y),
-                (cx + y, cy + x), (cx - y, cy + x),
-                (cx + y, cy - x), (cx - y, cy - x),
+                (cx + x, cy + y),
+                (cx - x, cy + y),
+                (cx + x, cy - y),
+                (cx - x, cy - y),
+                (cx + y, cy + x),
+                (cx - y, cy + x),
+                (cx + y, cy - x),
+                (cx - y, cy - x),
             ] {
                 if px >= 0 && py >= 0 {
                     self.paint_pixel(px as usize, py as usize, color);
@@ -443,20 +421,55 @@ impl DrawMePixApp {
             x += 1;
         }
     }
+
+    fn copy_selection(&mut self) {
+        if let Some((x0, y0, x1, y1)) = self.selection {
+            let w = x1 - x0 + 1;
+            let h = y1 - y0 + 1;
+            let mut buf = vec![vec![egui::Color32::TRANSPARENT; w]; h];
+            for dy in 0..h {
+                for dx in 0..w {
+                    buf[dy][dx] = self.grid[y0 + dy][x0 + dx];
+                }
+            }
+            self.clipboard = Some(buf);
+            self.last_status = Some(format!("Copié {} × {}", w, h));
+        } else {
+            self.last_status = Some("Rien à copier — sélection vide".to_string());
+        }
+    }
+
+    fn paste_at(&mut self, dx: usize, dy: usize) {
+        if let Some(buf) = self.clipboard.clone() {
+            self.push_history();
+            let h = buf.len();
+            let w = if h > 0 { buf[0].len() } else { 0 };
+            for y in 0..h {
+                for x in 0..w {
+                    let gx = dx + x;
+                    let gy = dy + y;
+                    if gx < self.grid_width && gy < self.grid_height {
+                        self.grid[gy][gx] = buf[y][x];
+                    }
+                }
+            }
+            self.texture_dirty = true;
+            self.last_status = Some("Collé".to_string());
+        }
+    }
 }
 
 impl eframe::App for DrawMePixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Applique le thème (clair / sombre) selon le réglage courant.
         if self.dark_mode {
             ctx.set_visuals(egui::Visuals::dark());
         } else {
             ctx.set_visuals(egui::Visuals::light());
         }
-        // === Désactive le zoom natif d'egui sur Cmd+/- ===
+
         ctx.options_mut(|opts| opts.zoom_with_keyboard = false);
 
-        // === Raccourcis clavier ===
+        // === Raccourcis qui ne sont pas interceptés par egui (lecture seule) ===
         ctx.input(|i| {
             if i.modifiers.command && i.key_pressed(egui::Key::Z) {
                 if i.modifiers.shift {
@@ -471,7 +484,6 @@ impl eframe::App for DrawMePixApp {
             if i.key_pressed(egui::Key::G) {
                 self.show_grid = !self.show_grid;
             }
-            // Cmd + = (et donc Cmd + Shift + + sur AZERTY) → zoom in
             if i.modifiers.command && i.key_pressed(egui::Key::Equals) {
                 self.zoom = (self.zoom * 1.25).min(MAX_ZOOM);
             }
@@ -481,15 +493,73 @@ impl eframe::App for DrawMePixApp {
             if i.modifiers.command && i.key_pressed(egui::Key::Num0) {
                 self.zoom = 1.0;
             }
+            if i.key_pressed(egui::Key::Escape) {
+                self.selection = None;
+            }
         });
 
-        // === Zoom au pinch trackpad (gesture naturel macOS) ===
+        // === Raccourcis qui DOIVENT consumer la touche en priorité ===
+        // (sinon egui les bouffe pour ses TextEdit / Sliders internes)
+
+        // Cmd+C : copier la sélection
+        let copy_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::C));
+        if copy_pressed {
+            self.copy_selection();
+        }
+
+        // Cmd+V : coller au coin haut-gauche de la sélection (ou en 0,0)
+        let paste_pressed =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::V));
+        if paste_pressed {
+            let (dx, dy) = self.selection.map(|s| (s.0, s.1)).unwrap_or((0, 0));
+            self.paste_at(dx, dy);
+        }
+
+        // Cmd+A : sélectionner tout le canvas
+        let select_all_pressed =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A));
+        if select_all_pressed {
+            self.selection = Some((0, 0, self.grid_width - 1, self.grid_height - 1));
+        }
+
+        // === Copy / Paste : sur Mac, egui les convertit en Event::Copy / Event::Paste ===
+        // On scanne les events pour les attraper, parce que consume_key sur Key::C / Key::V
+        // ne marche pas (egui les a déjà transformés avant qu'ils n'arrivent en queue).
+        let mut should_copy = false;
+        let mut should_paste = false;
+        let mut should_select_all = false;
+        ctx.input(|i| {
+            for event in &i.events {
+                match event {
+                    egui::Event::Copy => should_copy = true,
+                    egui::Event::Paste(_) => should_paste = true,
+                    _ => {}
+                }
+            }
+            // Cmd+A reste un event clavier classique (pas converti)
+            if i.modifiers.command && i.key_pressed(egui::Key::A) {
+                should_select_all = true;
+            }
+        });
+
+        if should_copy {
+            self.copy_selection();
+        }
+        if should_paste {
+            let (dx, dy) = self.selection.map(|s| (s.0, s.1)).unwrap_or((0, 0));
+            self.paste_at(dx, dy);
+        }
+        if should_select_all {
+            self.selection = Some((0, 0, self.grid_width - 1, self.grid_height - 1));
+        }
+
+        // === Zoom au pinch trackpad ===
         let zoom_delta = ctx.input(|i| i.zoom_delta());
         if (zoom_delta - 1.0).abs() > 0.001 {
             self.zoom = (self.zoom * zoom_delta).clamp(MIN_ZOOM, MAX_ZOOM);
         }
 
-        // === Zoom au Cmd + molette (souris) ===
+        // === Zoom au Cmd + molette ===
         let (cmd_down, scroll_y) = ctx.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
         if cmd_down && scroll_y.abs() > 0.1 {
             let factor = (scroll_y * 0.005).exp();
@@ -578,12 +648,33 @@ impl eframe::App for DrawMePixApp {
                         self.clear_canvas();
                         ui.close_menu();
                     }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.selection.is_some(),
+                            egui::Button::new("Copier (Ctrl + C)"),
+                        )
+                        .clicked()
+                    {
+                        self.copy_selection();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.clipboard.is_some(),
+                            egui::Button::new("Coller (Ctrl + V)"),
+                        )
+                        .clicked()
+                    {
+                        let (dx, dy) = self.selection.map(|s| (s.0, s.1)).unwrap_or((0, 0));
+                        self.paste_at(dx, dy);
+                        ui.close_menu();
+                    }
                 });
 
                 ui.separator();
                 ui.checkbox(&mut self.dark_mode, "Mode sombre");
 
-                // === Infos à droite ===
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("Zoom : {:.0} %", self.zoom * 100.0));
                     ui.separator();
@@ -633,8 +724,6 @@ impl eframe::App for DrawMePixApp {
                     .spacing([4.0, 4.0])
                     .show(ui, |ui| {
                         for i in 0..self.preset_palette.len() {
-                            // On copie la couleur pour ne pas garder d'emprunt
-                            // sur self.preset_palette pendant qu'on modifie self.
                             let color = self.preset_palette[i];
                             let is_selected = color == self.current_color;
                             let stroke = if is_selected {
@@ -757,6 +846,7 @@ impl eframe::App for DrawMePixApp {
                     ui.selectable_value(&mut self.tool, Tool::Line, "Ligne");
                     ui.selectable_value(&mut self.tool, Tool::Rect, "Carré");
                     ui.selectable_value(&mut self.tool, Tool::Circle, "Cercle");
+                    ui.selectable_value(&mut self.tool, Tool::Select, "Sélectionner");
                 });
                 ui.separator();
                 ui.label("Taille du pinceau");
@@ -840,8 +930,44 @@ impl eframe::App for DrawMePixApp {
                         ui.allocate_painter(canvas_size, egui::Sense::click_and_drag());
                     let canvas_rect = response.rect;
 
-                    // === 1. Rendu rapide : on régénère la texture si la grille a changé,
-                    // puis on la dessine en UN SEUL appel quel que soit la taille du canvas.
+                    // === Damier d'arrière-plan (pour visualiser la transparence) ===
+                    // Dessiné AVANT la texture : les pixels transparents le laisseront voir.
+                    // Culling sur les cellules visibles pour rester rapide même en gros canvas.
+                    {
+                        const CHECKER_LIGHT: egui::Color32 = egui::Color32::from_rgb(220, 220, 220);
+                        const CHECKER_DARK: egui::Color32 = egui::Color32::from_rgb(180, 180, 180);
+
+                        let visible = ui.clip_rect();
+                        let sx = (((visible.min.x - canvas_rect.min.x) / pixel_size).floor() as i32)
+                            .max(0) as usize;
+                        let sy = (((visible.min.y - canvas_rect.min.y) / pixel_size).floor() as i32)
+                            .max(0) as usize;
+                        let ex = (((visible.max.x - canvas_rect.min.x) / pixel_size).ceil() as i32)
+                            .max(0) as usize;
+                        let ey = (((visible.max.y - canvas_rect.min.y) / pixel_size).ceil() as i32)
+                            .max(0) as usize;
+                        let ex = ex.min(self.grid_width);
+                        let ey = ey.min(self.grid_height);
+
+                        for y in sy..ey {
+                            for x in sx..ex {
+                                let p = canvas_rect.min
+                                    + egui::vec2(x as f32 * pixel_size, y as f32 * pixel_size);
+                                let r = egui::Rect::from_min_size(
+                                    p,
+                                    egui::vec2(pixel_size, pixel_size),
+                                );
+                                let checker = if (x + y) % 2 == 0 {
+                                    CHECKER_LIGHT
+                                } else {
+                                    CHECKER_DARK
+                                };
+                                painter.rect_filled(r, 0.0, checker);
+                            }
+                        }
+                    }
+
+                    // 1. Rendu de la texture
                     if self.texture_dirty || self.canvas_texture.is_none() {
                         self.rebuild_canvas_texture(ctx);
                     }
@@ -854,8 +980,7 @@ impl eframe::App for DrawMePixApp {
                         );
                     }
 
-                    // === 2. Grille (lignes fines) : seulement quand on est zoomé assez,
-                    // et seulement sur les cellules effectivement visibles à l'écran.
+                    // 2. Grille
                     if self.show_grid && pixel_size > 6.0 {
                         let visible = ui.clip_rect();
                         let sx = (((visible.min.x - canvas_rect.min.x) / pixel_size).floor() as i32)
@@ -883,7 +1008,22 @@ impl eframe::App for DrawMePixApp {
                         }
                     }
 
-                    // === 3. Hover detection ===
+                    // 3. Rendu de la sélection (par-dessus la grille pour rester visible)
+                    if let Some((x0, y0, x1, y1)) = self.selection {
+                        let sel_pos = canvas_rect.min
+                            + egui::vec2(x0 as f32 * pixel_size, y0 as f32 * pixel_size);
+                        let sel_size = egui::vec2(
+                            (x1 - x0 + 1) as f32 * pixel_size,
+                            (y1 - y0 + 1) as f32 * pixel_size,
+                        );
+                        painter.rect_stroke(
+                            egui::Rect::from_min_size(sel_pos, sel_size),
+                            0.0,
+                            egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 150, 255)),
+                        );
+                    }
+
+                    // 4. Hover detection
                     self.hovered_cell = response.hover_pos().and_then(|pos| {
                         let rel = pos - canvas_rect.min;
                         let x = (rel.x / pixel_size) as usize;
@@ -895,19 +1035,15 @@ impl eframe::App for DrawMePixApp {
                         }
                     });
 
-                    // === 4. Pan / Peinture / Formes géométriques ===
+                    // 5. Pan / Peinture / Formes / Sélection
                     let middle_down = ctx.input(|i| i.pointer.middle_down());
                     if middle_down {
-                        // Pan avec clic molette (inchangé)
                         let delta = ctx.input(|i| i.pointer.delta());
                         ui.scroll_with_delta(-delta);
                         ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
                         self.is_drawing = false;
                         self.last_paint_cell = None;
                     } else {
-                        // On détecte les transitions de drag pour les formes géométriques :
-                        // - drag_started : la souris vient juste d'être enfoncée et bouge
-                        // - drag_released : la souris vient juste d'être relâchée
                         let drag_started = response.drag_started();
                         let drag_released = response.drag_stopped();
                         let pressed = response.is_pointer_button_down_on();
@@ -921,13 +1057,12 @@ impl eframe::App for DrawMePixApp {
                                 let alt_pressed = ctx.input(|i| i.modifiers.alt);
                                 let right_pressed = ctx.input(|i| i.pointer.secondary_down());
                                 let color = if right_pressed {
-                                    egui::Color32::WHITE
+                                    egui::Color32::TRANSPARENT
                                 } else {
                                     self.current_color
                                 };
 
                                 if alt_pressed && pressed {
-                                    // Pipette : récupère la couleur du pixel survolé
                                     self.current_color = self.grid[cy][cx];
                                     self.remember_color(self.grid[cy][cx]);
                                 } else {
@@ -939,9 +1074,6 @@ impl eframe::App for DrawMePixApp {
                                                     self.is_drawing = true;
                                                     self.last_paint_cell = None;
                                                 }
-                                                // Interpolation : on relie la dernière
-                                                // cellule à la cellule actuelle pour
-                                                // éviter les "trous" sur les drags rapides.
                                                 if let Some((px, py)) = self.last_paint_cell {
                                                     self.paint_line(px, py, cx, cy, color);
                                                 }
@@ -956,14 +1088,31 @@ impl eframe::App for DrawMePixApp {
                                                 self.flood_fill(cx, cy, color);
                                             }
                                         }
+                                        Tool::Select => {
+                                            if drag_started {
+                                                self.shape_start = Some((cx, cy));
+                                            }
+                                            if drag_released {
+                                                if let Some((x0, y0)) = self.shape_start.take() {
+                                                    let (x_min, x_max) =
+                                                        if x0 < cx { (x0, cx) } else { (cx, x0) };
+                                                    let (y_min, y_max) =
+                                                        if y0 < cy { (y0, cy) } else { (cy, y0) };
+                                                    self.selection =
+                                                        Some((x_min, y_min, x_max, y_max));
+                                                    self.last_status = Some(format!(
+                                                        "Sélection {}×{}",
+                                                        x_max - x_min + 1,
+                                                        y_max - y_min + 1
+                                                    ));
+                                                }
+                                            }
+                                        }
                                         Tool::Line | Tool::Rect | Tool::Circle => {
-                                            // Au DÉBUT du drag : on mémorise l'ancrage
-                                            // et on snapshot l'historique une seule fois.
                                             if drag_started {
                                                 self.shape_start = Some((cx, cy));
                                                 self.push_history();
                                             }
-                                            // À la FIN du drag : on commit la forme finale.
                                             if drag_released {
                                                 if let Some((x0, y0)) = self.shape_start.take() {
                                                     match self.tool {
@@ -978,8 +1127,6 @@ impl eframe::App for DrawMePixApp {
                                                             self.draw_rect(x0, y0, cx, cy, color)
                                                         }
                                                         Tool::Circle => {
-                                                            // Rayon = distance entre ancrage
-                                                            // et point de relâchement
                                                             let dx = cx as isize - x0 as isize;
                                                             let dy = cy as isize - y0 as isize;
                                                             let r = ((dx * dx + dy * dy) as f32)
