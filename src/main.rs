@@ -913,6 +913,47 @@ impl eframe::App for DrawMePixApp {
             }
         }
 
+        //Panel droite
+        egui::SidePanel::right("preview_panel")
+        .resizable(false)
+        .default_width(220.0)
+        .show(ctx, |ui| {
+            ui.heading("Aperçu");
+            ui.label(format!("{}×{}", self.grid_width, self.grid_height));
+            ui.separator();
+
+            //On dessine une mini-version du canvas à taille native (1px = 1px)
+            //ou avec un léger upscale si le canvas est très petit.
+            let max_preview = 200.0;
+            let preview_pixel = (max_preview / self.grid_width.max(self.grid_height) as f32)
+                .floor()
+                .max(1.0);
+            let preview_size = egui::vec2(
+                self.grid_width as f32 * preview_pixel,
+                self.grid_height as f32 * preview_pixel,
+            );
+
+            let (rect, _)= ui.allocate_exact_size(preview_size, egui::Sense::hover());
+            let painter= ui.painter();
+            for y in 0..self.grid_height {
+                for x in 0..self.grid_width {
+                    let pos = rect.min + egui::vec2(
+                        x as f32 * preview_pixel,
+                        y as f32 * preview_pixel,
+                    );
+                    let r = egui::Rect::from_min_size(
+                        pos,
+                        egui::vec2(preview_pixel, preview_pixel),
+                    );
+                    let c = self.grid[y][x];
+                    if c.a() > 0 {
+                        painter.rect_filled(r, 0.0, c);
+                    }
+                }
+            }
+        });
+
+
         // === Zone centrale : canvas ===
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::both()
@@ -977,6 +1018,20 @@ impl eframe::App for DrawMePixApp {
                             canvas_rect,
                             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                             egui::Color32::WHITE,
+                        );
+                    }
+
+                    if let Some((hx, hy)) = self.hovered_cell {
+                        let hover_pos = canvas_rect.min + egui::vec2(
+                            hx as f32 * pixel_size,
+                            hy as f32 * pixel_size,
+                        );
+                        let hover_rect = egui::Rect::from_min_size(
+                            hover_pos,
+                            egui::vec2(pixel_size, pixel_size),
+                        );
+                        //Un contour épais de la couleur active pour prévisualiser
+                        painter.rect_stroke(hover_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::BLACK),
                         );
                     }
 
