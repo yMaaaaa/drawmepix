@@ -63,9 +63,13 @@ fn main() -> Result<(), eframe::Error> {
 }
 
 struct DrawMePixApp {
-    grid: Vec<Vec<egui::Color32>>,
-    grid_width: usize,
-    grid_height: usize,
+    frames: Vec<Vec<Vec<egui::Color32>>>,
+    current_frame: usize,
+    fps: u32,
+    is_playing: bool,
+    last_frame_advance: f64, //timestamp en secondes
+    frames_width: usize,
+    frames_height: usize,
     current_color: egui::Color32,
     preset_palette: Vec<egui::Color32>,
     custom_palette: Vec<egui::Color32>,
@@ -104,9 +108,16 @@ struct DrawMePixApp {
 impl Default for DrawMePixApp {
     fn default() -> Self {
         Self {
-            grid: vec![vec![egui::Color32::TRANSPARENT; DEFAULT_GRID_SIZE]; DEFAULT_GRID_SIZE],
-            grid_width: DEFAULT_GRID_SIZE,
-            grid_height: DEFAULT_GRID_SIZE,
+            frames: vec![vec![
+                vec![egui::Color32::TRANSPARENT; DEFAULT_GRID_SIZE];
+                DEFAULT_GRID_SIZE
+            ]],
+            current_frame: 0,
+            fps: 8,
+            is_playing: false,
+            last_frame_advance: 0.0,
+            frames_width: DEFAULT_GRID_SIZE,
+            frames_height: DEFAULT_GRID_SIZE,
             current_color: egui::Color32::BLACK,
             preset_palette: preset_palette(),
             custom_palette: Vec::new(),
@@ -138,34 +149,39 @@ impl Default for DrawMePixApp {
 }
 
 impl DrawMePixApp {
+    fn fresh_frames(width: usize, height: usize) -> Vec<Vec<Vec<egui::Color32>>> {
+        vec![Self::fresh_grid(width, height)]
+    }
+
     fn create_new_canvas(&mut self, width: usize, height: usize) {
         self.push_history();
-        self.grid_width = width.clamp(4, 4096);
-        self.grid_height = height.clamp(4, 4096);
-        self.grid = Self::fresh_grid(self.grid_width, self.grid_height);
+        self.frames_width = width.clamp(4, 4096);
+        self.frames_height = height.clamp(4, 4096);
+        self.frames = Self::fresh_frames(self.frames_width, self.frames_height);
+        self.current_frame = 0;
         self.zoom = 1.0;
         self.hovered_cell = None;
         self.texture_dirty = true;
         self.last_status = Some(format!(
             "Nouveau canvas {}×{}",
-            self.grid_width, self.grid_height
+            self.frames_width, self.frames_height
         ));
     }
 
     fn clear_canvas(&mut self) {
         self.push_history();
-        self.grid = Self::fresh_grid(self.grid_width, self.grid_height);
+        self.frames[self.current_frame] = Self::fresh_grid(self.frames_width, self.frames_height);
         self.texture_dirty = true;
         self.last_status = Some("Canvas effacé".to_string());
     }
 
     fn save_png(&self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-        let w = self.grid_width as u32;
-        let h = self.grid_height as u32;
+        let w = self.frames_width as u32;
+        let h = self.frames_height as u32;
         let mut img = image::RgbaImage::new(w, h);
-        for y in 0..self.grid_height {
-            for x in 0..self.grid_width {
-                let c = self.grid[y][x];
+        for y in 0..self.frames_height {
+            for x in 0..self.frames_width {
+                let c = self.frames[self.current_frame][y][x];
                 img.put_pixel(
                     x as u32,
                     y as u32,
@@ -192,7 +208,7 @@ impl DrawMePixApp {
     }
 
     fn flood_fill(&mut self, start_x: usize, start_y: usize, new_color: egui::Color32) {
-        let source_color = self.grid[start_y][start_x];
+        let source_color = self.frames[self.current_frame][start_y][start_x];
         if source_color == new_color {
             return;
         }
@@ -201,21 +217,21 @@ impl DrawMePixApp {
         queue.push_back((start_x, start_y));
 
         while let Some((x, y)) = queue.pop_front() {
-            if self.grid[y][x] != source_color {
+            if self.frames[self.current_frame][y][x] != source_color {
                 continue;
             }
-            self.grid[y][x] = new_color;
+            self.frames[self.current_frame][y][x] = new_color;
 
             if x > 0 {
                 queue.push_back((x - 1, y));
             }
-            if x < self.grid_width - 1 {
+            if x < self.frames_width - 1 {
                 queue.push_back((x + 1, y));
             }
             if y > 0 {
                 queue.push_back((x, y - 1));
             }
-            if y < self.grid_height - 1 {
+            if y < self.frames_height - 1 {
                 queue.push_back((x, y + 1));
             }
         }
@@ -235,9 +251,10 @@ impl DrawMePixApp {
             }
         }
 
-        self.grid_width = w;
-        self.grid_height = h;
-        self.grid = new_grid;
+        self.frames_width = w;
+        self.frames_height = h;
+        self.frames = vec![new_grid];
+        self.current_frame = 0;
         self.history.clear();
         self.redo_stack.clear();
         self.zoom = 1.0;
@@ -247,19 +264,19 @@ impl DrawMePixApp {
     }
 
     fn paint_pixel(&mut self, x: usize, y: usize, color: egui::Color32) {
-        self.grid[y][x] = color;
+        self.frames[self.current_frame][y][x] = color;
         if self.mirror_horizontal {
-            let mx = self.grid_width - 1 - x;
-            self.grid[y][mx] = color;
+            let mx = self.frames_width - 1 - x;
+            self.frames[self.current_frame][y][mx] = color;
         }
         if self.mirror_vertical {
-            let my = self.grid_height - 1 - y;
-            self.grid[my][x] = color;
+            let my = self.frames_height - 1 - y;
+            self.frames[self.current_frame][my][x] = color;
         }
         if self.mirror_horizontal && self.mirror_vertical {
-            let mx = self.grid_width - 1 - x;
-            let my = self.grid_height - 1 - y;
-            self.grid[my][mx] = color;
+            let mx = self.frames_width - 1 - x;
+            let my = self.frames_height - 1 - y;
+            self.frames[self.current_frame][my][mx] = color;
         }
         self.texture_dirty = true;
     }
@@ -276,8 +293,8 @@ impl DrawMePixApp {
         loop {
             if x0 >= 0
                 && y0 >= 0
-                && (x0 as usize) < self.grid_width
-                && (y0 as usize) < self.grid_height
+                && (x0 as usize) < self.frames_width
+                && (y0 as usize) < self.frames_height
             {
                 self.paint_pixel(x0 as usize, y0 as usize, color);
             }
@@ -297,7 +314,7 @@ impl DrawMePixApp {
     }
 
     fn push_history(&mut self) {
-        self.history.push(self.grid.clone());
+        self.history.push(self.frames[self.current_frame].clone());
         self.redo_stack.clear();
         if self.history.len() > 100 {
             self.history.remove(0);
@@ -306,34 +323,35 @@ impl DrawMePixApp {
 
     fn undo(&mut self) {
         if let Some(previous) = self.history.pop() {
-            self.redo_stack.push(self.grid.clone());
-            self.grid = previous;
+            self.redo_stack
+                .push(self.frames[self.current_frame].clone());
+            self.frames[self.current_frame] = previous;
             self.texture_dirty = true;
         }
     }
 
     fn redo(&mut self) {
         if let Some(next) = self.redo_stack.pop() {
-            self.history.push(self.grid.clone());
-            self.grid = next;
+            self.history.push(self.frames[self.current_frame].clone());
+            self.frames[self.current_frame] = next;
             self.texture_dirty = true;
         }
     }
 
     fn fresh_grid(width: usize, height: usize) -> Vec<Vec<egui::Color32>> {
-        vec![vec![egui::Color32::TRANSPARENT; width]; height]  // ← TRANSPARENT au lieu de WHITE
+        vec![vec![egui::Color32::TRANSPARENT; width]; height] // ← TRANSPARENT au lieu de WHITE
     }
 
     fn rebuild_canvas_texture(&mut self, ctx: &egui::Context) {
-        let mut pixels = Vec::with_capacity(self.grid_width * self.grid_height);
-        for y in 0..self.grid_height {
-            for x in 0..self.grid_width {
-                pixels.push(self.grid[y][x]);
+        let mut pixels = Vec::with_capacity(self.frames_width * self.frames_height);
+        for y in 0..self.frames_height {
+            for x in 0..self.frames_width {
+                pixels.push(self.frames[self.current_frame][y][x]);
             }
         }
 
         let image = egui::ColorImage {
-            size: [self.grid_width, self.grid_height],
+            size: [self.frames_width, self.frames_height],
             pixels,
         };
 
@@ -429,7 +447,7 @@ impl DrawMePixApp {
             let mut buf = vec![vec![egui::Color32::TRANSPARENT; w]; h];
             for dy in 0..h {
                 for dx in 0..w {
-                    buf[dy][dx] = self.grid[y0 + dy][x0 + dx];
+                    buf[dy][dx] = self.frames[self.current_frame][y0 + dy][x0 + dx];
                 }
             }
             self.clipboard = Some(buf);
@@ -448,8 +466,8 @@ impl DrawMePixApp {
                 for x in 0..w {
                     let gx = dx + x;
                     let gy = dy + y;
-                    if gx < self.grid_width && gy < self.grid_height {
-                        self.grid[gy][gx] = buf[y][x];
+                    if gx < self.frames_width && gy < self.frames_height {
+                        self.frames[self.current_frame][gy][gx] = buf[y][x];
                     }
                 }
             }
@@ -457,15 +475,61 @@ impl DrawMePixApp {
             self.last_status = Some("Collé".to_string());
         }
     }
+
+    fn current_grid(&self) -> &Vec<Vec<egui::Color32>> {
+        &self.frames[self.current_frame]
+    }
+
+    fn current_grid_mut(&mut self) -> &mut Vec<Vec<egui::Color32>> {
+        &mut self.frames[self.current_frame]
+    }
+
+    fn add_frame(&mut self) {
+        self.push_history();
+        let new = Self::fresh_grid(self.frames_width, self.frames_height);
+        self.frames.insert(self.current_frame + 1, new);
+        self.current_frame += 1;
+    }
+
+    fn duplicate_frame(&mut self) {
+        self.push_history();
+        let copy = self.frames[self.current_frame].clone();
+        self.frames.insert(self.current_frame + 1, copy);
+        self.current_frame += 1;
+    }
+
+    fn remove_frame(&mut self) {
+        if self.frames.len() > 1 {
+            self.push_history();
+            self.frames.remove(self.current_frame);
+            if self.current_frame >= self.frames.len() {
+                self.current_frame = self.frames.len() - 1;
+            }
+        }
+    }
 }
 
 impl eframe::App for DrawMePixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+
+        if self.is_playing && self.frames.len() > 1 {
+            let now = ctx.input(|i| i.time);
+            let interval = 1.0 / self.fps as f64;
+            if now - self.last_frame_advance >= interval {
+                self.current_frame = (self.current_frame + 1) % self.frames.len();
+                self.last_frame_advance = now;
+                ctx.request_repaint();
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            }
+        }
+
         if self.dark_mode {
             ctx.set_visuals(egui::Visuals::dark());
         } else {
             ctx.set_visuals(egui::Visuals::light());
         }
+
 
         ctx.options_mut(|opts| opts.zoom_with_keyboard = false);
 
@@ -519,7 +583,7 @@ impl eframe::App for DrawMePixApp {
         let select_all_pressed =
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A));
         if select_all_pressed {
-            self.selection = Some((0, 0, self.grid_width - 1, self.grid_height - 1));
+            self.selection = Some((0, 0, self.frames_width - 1, self.frames_height - 1));
         }
 
         // === Copy / Paste : sur Mac, egui les convertit en Event::Copy / Event::Paste ===
@@ -550,7 +614,7 @@ impl eframe::App for DrawMePixApp {
             self.paste_at(dx, dy);
         }
         if should_select_all {
-            self.selection = Some((0, 0, self.grid_width - 1, self.grid_height - 1));
+            self.selection = Some((0, 0, self.frames_width - 1, self.frames_height - 1));
         }
 
         // === Zoom au pinch trackpad ===
@@ -572,8 +636,8 @@ impl eframe::App for DrawMePixApp {
                 ui.menu_button("Fichier", |ui| {
                     if ui.button("Nouveau canvas…").clicked() {
                         self.show_new_dialog = true;
-                        self.new_grid_width_input = self.grid_width;
-                        self.new_grid_height_input = self.grid_height;
+                        self.new_grid_width_input = self.frames_width;
+                        self.new_grid_height_input = self.frames_height;
                         ui.close_menu();
                     }
                     if ui.button("Ouvrir...").clicked() {
@@ -678,7 +742,10 @@ impl eframe::App for DrawMePixApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("Zoom : {:.0} %", self.zoom * 100.0));
                     ui.separator();
-                    ui.label(format!("Canvas : {}×{}", self.grid_width, self.grid_height));
+                    ui.label(format!(
+                        "Canvas : {}×{}",
+                        self.frames_width, self.frames_height
+                    ));
                 });
             });
         });
@@ -915,57 +982,95 @@ impl eframe::App for DrawMePixApp {
 
         //Panel droite
         egui::SidePanel::right("preview_panel")
-        .resizable(false)
-        .default_width(220.0)
-        .show(ctx, |ui| {
-            ui.heading("Aperçu");
-            ui.label(format!("{}×{}", self.grid_width, self.grid_height));
-            ui.separator();
+            .resizable(false)
+            .default_width(220.0)
+            .show(ctx, |ui| {
+                ui.heading("Aperçu");
+                ui.label(format!("{}×{}", self.frames_width, self.frames_height));
+                ui.separator();
 
-            //On dessine une mini-version du canvas à taille native (1px = 1px)
-            //ou avec un léger upscale si le canvas est très petit.
-            let max_preview = 200.0;
-            let preview_pixel = (max_preview / self.grid_width.max(self.grid_height) as f32)
-                .floor()
-                .max(1.0);
-            let preview_size = egui::vec2(
-                self.grid_width as f32 * preview_pixel,
-                self.grid_height as f32 * preview_pixel,
-            );
+                //On dessine une mini-version du canvas à taille native (1px = 1px)
+                //ou avec un léger upscale si le canvas est très petit.
+                let max_preview = 200.0;
+                let preview_pixel = (max_preview
+                    / self.frames_width.max(self.frames_height) as f32)
+                    .floor()
+                    .max(1.0);
+                let preview_size = egui::vec2(
+                    self.frames_width as f32 * preview_pixel,
+                    self.frames_height as f32 * preview_pixel,
+                );
 
-            let (rect, _)= ui.allocate_exact_size(preview_size, egui::Sense::hover());
-            let painter= ui.painter();
-            for y in 0..self.grid_height {
-                for x in 0..self.grid_width {
-                    let pos = rect.min + egui::vec2(
-                        x as f32 * preview_pixel,
-                        y as f32 * preview_pixel,
-                    );
-                    let r = egui::Rect::from_min_size(
-                        pos,
-                        egui::vec2(preview_pixel, preview_pixel),
-                    );
-                    let c = self.grid[y][x];
-                    if c.a() > 0 {
-                        painter.rect_filled(r, 0.0, c);
+                let (rect, _) = ui.allocate_exact_size(preview_size, egui::Sense::hover());
+                let painter = ui.painter();
+                for y in 0..self.frames_height {
+                    for x in 0..self.frames_width {
+                        let pos = rect.min
+                            + egui::vec2(x as f32 * preview_pixel, y as f32 * preview_pixel);
+                        let r = egui::Rect::from_min_size(
+                            pos,
+                            egui::vec2(preview_pixel, preview_pixel),
+                        );
+                        let c = self.frames[self.current_frame][y][x];
+                        if c.a() > 0 {
+                            painter.rect_filled(r, 0.0, c);
+                        }
                     }
                 }
-            }
-        });
+            });
 
+        // === Frise des frames (en bas, AVANT le CentralPanel) ===
+        egui::TopBottomPanel::bottom("frames_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Frames");
+                if ui.button("Nouvelle").clicked() {
+                    self.add_frame();
+                }
+                if ui.button("Dupliquer").clicked() {
+                    self.duplicate_frame();
+                }
+                if ui.button("Supprimer").clicked() {
+                    self.remove_frame();
+                }
+                ui.separator();
+                let play_label = if self.is_playing {
+                    "⏸ Pause"
+                } else {
+                    "▶ Play"
+                };
+                if ui.button(play_label).clicked() {
+                    self.is_playing = !self.is_playing;
+                }
+                ui.add(egui::Slider::new(&mut self.fps, 1..=60).text("FPS"));
+            });
+
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let count = self.frames.len();
+                    for i in 0..count {
+                        let is_current = i == self.current_frame;
+                        let label = format!("{}{}", i + 1, if is_current { " ◀" } else { "" });
+                        if ui.button(label).clicked() {
+                            self.current_frame = i;
+                            self.texture_dirty = true; // important pour refresh le canvas
+                        }
+                    }
+                });
+            });
+        });
 
         // === Zone centrale : canvas ===
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::both()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
-                    let max_dim = self.grid_width.max(self.grid_height) as f32;
+                    let max_dim = self.frames_width.max(self.frames_height) as f32;
                     let base_pixel_size = (MAX_CANVAS_SIZE / max_dim).floor().max(1.0);
                     let pixel_size = (base_pixel_size * self.zoom).max(1.0);
 
                     let canvas_size = egui::vec2(
-                        self.grid_width as f32 * pixel_size,
-                        self.grid_height as f32 * pixel_size,
+                        self.frames_width as f32 * pixel_size,
+                        self.frames_height as f32 * pixel_size,
                     );
                     let (response, painter) =
                         ui.allocate_painter(canvas_size, egui::Sense::click_and_drag());
@@ -987,8 +1092,8 @@ impl eframe::App for DrawMePixApp {
                             .max(0) as usize;
                         let ey = (((visible.max.y - canvas_rect.min.y) / pixel_size).ceil() as i32)
                             .max(0) as usize;
-                        let ex = ex.min(self.grid_width);
-                        let ey = ey.min(self.grid_height);
+                        let ex = ex.min(self.frames_width);
+                        let ey = ey.min(self.frames_height);
 
                         for y in sy..ey {
                             for x in sx..ex {
@@ -1022,16 +1127,17 @@ impl eframe::App for DrawMePixApp {
                     }
 
                     if let Some((hx, hy)) = self.hovered_cell {
-                        let hover_pos = canvas_rect.min + egui::vec2(
-                            hx as f32 * pixel_size,
-                            hy as f32 * pixel_size,
-                        );
+                        let hover_pos = canvas_rect.min
+                            + egui::vec2(hx as f32 * pixel_size, hy as f32 * pixel_size);
                         let hover_rect = egui::Rect::from_min_size(
                             hover_pos,
                             egui::vec2(pixel_size, pixel_size),
                         );
                         //Un contour épais de la couleur active pour prévisualiser
-                        painter.rect_stroke(hover_rect, 0.0, egui::Stroke::new(1.0, egui::Color32::BLACK),
+                        painter.rect_stroke(
+                            hover_rect,
+                            0.0,
+                            egui::Stroke::new(1.0, egui::Color32::BLACK),
                         );
                     }
 
@@ -1046,8 +1152,8 @@ impl eframe::App for DrawMePixApp {
                             .max(0) as usize;
                         let ey = (((visible.max.y - canvas_rect.min.y) / pixel_size).ceil() as i32)
                             .max(0) as usize;
-                        let ex = ex.min(self.grid_width);
-                        let ey = ey.min(self.grid_height);
+                        let ex = ex.min(self.frames_width);
+                        let ey = ey.min(self.frames_height);
 
                         let stroke = egui::Stroke::new(0.5, egui::Color32::from_gray(220));
                         for y in sy..ey {
@@ -1083,7 +1189,7 @@ impl eframe::App for DrawMePixApp {
                         let rel = pos - canvas_rect.min;
                         let x = (rel.x / pixel_size) as usize;
                         let y = (rel.y / pixel_size) as usize;
-                        if x < self.grid_width && y < self.grid_height {
+                        if x < self.frames_width && y < self.frames_height {
                             Some((x, y))
                         } else {
                             None
@@ -1108,7 +1214,7 @@ impl eframe::App for DrawMePixApp {
                             let cx = (rel.x / pixel_size) as usize;
                             let cy = (rel.y / pixel_size) as usize;
 
-                            if cx < self.grid_width && cy < self.grid_height {
+                            if cx < self.frames_width && cy < self.frames_height {
                                 let alt_pressed = ctx.input(|i| i.modifiers.alt);
                                 let right_pressed = ctx.input(|i| i.pointer.secondary_down());
                                 let color = if right_pressed {
@@ -1118,8 +1224,8 @@ impl eframe::App for DrawMePixApp {
                                 };
 
                                 if alt_pressed && pressed {
-                                    self.current_color = self.grid[cy][cx];
-                                    self.remember_color(self.grid[cy][cx]);
+                                    self.current_color = self.frames[self.current_frame][cy][cx];
+                                    self.remember_color(self.frames[self.current_frame][cy][cx]);
                                 } else {
                                     match self.tool {
                                         Tool::Brush => {
