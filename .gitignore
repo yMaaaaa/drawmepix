@@ -1,3 +1,7 @@
 /target
 DrawMePix-*.zip
 *.zip
+*.tar.gz
+*.dmg
+*.exe
+*.app/

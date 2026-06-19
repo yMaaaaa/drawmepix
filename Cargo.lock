@@ -2772,6 +2772,7 @@ name = "pixel-project"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "gif",
  "image",
  "rfd",
 ]
