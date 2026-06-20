@@ -839,8 +839,8 @@ impl eframe::App for DrawMePixApp {
                 ui.menu_button("Affichage", |ui| {
                     ui.checkbox(&mut self.show_grid, "Afficher la grille");
                     ui.separator();
-                    ui.checkbox(&mut self.mirror_horizontal, "Miroir horizontal");
-                    ui.checkbox(&mut self.mirror_vertical, "Miroir vertical");
+                    ui.checkbox(&mut self.mirror_horizontal, "Miroir vertical");
+                    ui.checkbox(&mut self.mirror_vertical, "Miroir horizontal");
                     ui.separator();
                     if ui.button("Zoom +").clicked() {
                         self.zoom = (self.zoom * 1.25).min(MAX_ZOOM);
