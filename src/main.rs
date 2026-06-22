@@ -1,10 +1,14 @@
 use eframe::egui::{self};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 const MAX_CANVAS_SIZE: f32 = 640.0;
 const DEFAULT_GRID_SIZE: usize = 16;
 const MIN_ZOOM: f32 = 0.25;
 const MAX_ZOOM: f32 = 32.0;
 const MAX_RECENT_COLORS: usize = 10;
+const PROJECT_VERSION: u32 = 1;
+const AUTOSAVE_INTERVAL_SECS: f64 = 60.0;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tool {
@@ -87,12 +91,54 @@ impl Frame {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Format projet sérialisable (.drawmepix)
+// ---------------------------------------------------------------------------
+// egui::Color32 n'implémente pas Serialize, donc on stocke les pixels en
+// [u8; 4] (RGBA) et on convertit au save/load.
+
+#[derive(Serialize, Deserialize)]
+struct ProjectLayer {
+    name: String,
+    visible: bool,
+    opacity: f32,
+    pixels: Vec<Vec<[u8; 4]>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ProjectFrame {
+    layers: Vec<ProjectLayer>,
+    active_layer: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Project {
+    version: u32,
+    width: usize,
+    height: usize,
+    fps: u32,
+    current_frame: usize,
+    frames: Vec<ProjectFrame>,
+    custom_palette: Vec<[u8; 4]>,
+}
+
+#[inline]
+fn color_to_array(c: egui::Color32) -> [u8; 4] {
+    [c.r(), c.g(), c.b(), c.a()]
+}
+
+#[inline]
+fn array_to_color(a: [u8; 4]) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(a[0], a[1], a[2], a[3])
+}
+
 fn preset_palette() -> Vec<egui::Color32> {
     vec![
         egui::Color32::BLACK,
         egui::Color32::from_rgb(64, 64, 64),
         egui::Color32::from_rgb(128, 128, 128),
         egui::Color32::from_rgb(192, 192, 192),
+        egui::Color32::WHITE,
         egui::Color32::TRANSPARENT,
         egui::Color32::from_rgb(139, 0, 0),
         egui::Color32::from_rgb(255, 0, 0),
@@ -168,10 +214,24 @@ struct DrawMePixApp {
     recent_colors: Vec<egui::Color32>,
     dark_mode: bool,
 
-    shape_start: Option<(usize, usize)>,
-
     selection: Option<(usize, usize, usize, usize)>,
     clipboard: Option<Vec<Vec<egui::Color32>>>,
+
+    // --- État projet / auto-save ---
+    current_project_path: Option<PathBuf>,
+    dirty: bool,
+    last_autosave_time: f64,
+
+    keep_selection_on_tool_change: bool,
+
+    shape_start: Option<(usize, usize)>,
+    shape_current: Option<(usize, usize)>,
+
+    pending_zoom_focus: Option<(egui::Pos2, f32, f32)>,
+    last_canvas_min: Option<egui::Pos2>,
+    scroll_offset: egui::Vec2,
+
+    renaming_layer: Option<usize>,
 }
 
 impl Default for DrawMePixApp {
@@ -207,9 +267,18 @@ impl Default for DrawMePixApp {
             brush_size: 1,
             recent_colors: Vec::new(),
             dark_mode: true,
-            shape_start: None,
             selection: None,
             clipboard: None,
+            current_project_path: None,
+            dirty: false,
+            last_autosave_time: 0.0,
+            keep_selection_on_tool_change: false,
+            shape_start: None,
+            shape_current: None,
+            pending_zoom_focus: None,
+            last_canvas_min: None,
+            scroll_offset: egui::Vec2::ZERO,
+            renaming_layer: None,
         }
     }
 }
@@ -411,6 +480,7 @@ impl DrawMePixApp {
         if self.history.len() > 100 {
             self.history.remove(0);
         }
+        self.dirty = true;
     }
 
     fn undo(&mut self) {
@@ -419,6 +489,7 @@ impl DrawMePixApp {
                 .push(self.frames[self.current_frame].clone());
             self.frames[self.current_frame] = previous;
             self.texture_dirty = true;
+            self.dirty = true;
         }
     }
 
@@ -427,6 +498,7 @@ impl DrawMePixApp {
             self.history.push(self.frames[self.current_frame].clone());
             self.frames[self.current_frame] = next;
             self.texture_dirty = true;
+            self.dirty = true;
         }
     }
 
@@ -453,81 +525,24 @@ impl DrawMePixApp {
         if self.recent_colors.len() > MAX_RECENT_COLORS {
             self.recent_colors.truncate(MAX_RECENT_COLORS);
         }
+        self.custom_picker = color;
     }
 
     fn draw_line(&mut self, x0: isize, y0: isize, x1: isize, y1: isize, color: egui::Color32) {
-        let dx = (x1 - x0).abs();
-        let dy = -(y1 - y0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-        let mut x = x0;
-        let mut y = y0;
-        loop {
-            if x >= 0 && y >= 0 {
-                self.paint_pixel(x as usize, y as usize, color);
-            }
-            if x == x1 && y == y1 {
-                break;
-            }
-            let e2 = 2 * err;
-            if e2 >= dy {
-                err += dy;
-                x += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y += sy;
-            }
+        for (x, y) in Self::bresenham_pixels(x0, y0, x1, y1) {
+            self.paint_pixel(x, y, color);
         }
     }
 
     fn draw_rect(&mut self, x0: usize, y0: usize, x1: usize, y1: usize, color: egui::Color32) {
-        let (x_min, x_max) = if x0 < x1 { (x0, x1) } else { (x1, x0) };
-        let (y_min, y_max) = if y0 < y1 { (y0, y1) } else { (y1, y0) };
-        for x in x_min..=x_max {
-            self.paint_pixel(x, y_min, color);
-            self.paint_pixel(x, y_max, color);
-        }
-        for y in y_min..=y_max {
-            self.paint_pixel(x_min, y, color);
-            self.paint_pixel(x_max, y, color);
+        for (x, y) in Self::rect_pixels(x0, y0, x1, y1) {
+            self.paint_pixel(x, y, color);
         }
     }
 
     fn draw_circle(&mut self, cx: usize, cy: usize, r: usize, color: egui::Color32) {
-        let r = r as isize;
-        let cx = cx as isize;
-        let cy = cy as isize;
-        let mut x: isize = 0;
-        let mut y = r;
-        let mut d = 1 - r;
-        while x <= y {
-            for (px, py) in [
-                (cx + x, cy + y),
-                (cx - x, cy + y),
-                (cx + x, cy - y),
-                (cx - x, cy - y),
-                (cx + y, cy + x),
-                (cx - y, cy + x),
-                (cx + y, cy - x),
-                (cx - y, cy - x),
-            ] {
-                if px >= 0
-                    && py >= 0
-                    && (px as usize) < self.frames_width
-                    && (py as usize) < self.frames_height
-                {
-                    self.paint_pixel(px as usize, py as usize, color);
-                }
-            }
-            if d < 0 {
-                d += 2 * x + 3;
-            } else {
-                d += 2 * (x - y) + 5;
-                y -= 1;
-            }
-            x += 1;
+        for (x, y) in Self::circle_pixels(cx as isize, cy as isize, r as isize) {
+            self.paint_pixel(x, y, color);
         }
     }
 
@@ -677,10 +692,289 @@ impl DrawMePixApp {
         }
         self.last_status = Some(format!("GIF sauvegardé : {}", path.display()));
     }
+
+    fn set_tool(&mut self, new_tool: Tool) {
+        if new_tool != self.tool && new_tool != Tool::Select {
+            if !self.keep_selection_on_tool_change {
+                self.selection = None;
+            }
+        }
+        self.tool = new_tool;
+    }
+
+    fn cut_selection(&mut self) {
+        self.copy_selection();
+        if let Some((x0, y0, x1, y1)) = self.selection {
+            self.push_history();
+            let cf = self.current_frame;
+            let frame = &mut self.frames[cf];
+            let al = frame.active_layer;
+            let pixels = &mut frame.layers[al].pixels;
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    pixels[y][x] = egui::Color32::TRANSPARENT;
+                }
+            }
+            self.texture_dirty = true;
+            self.last_status = Some("Coupé".to_string());
+        }
+    }
+
+    fn bresenham_pixels(x0: isize, y0: isize, x1: isize, y1: isize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let dx = (x1 - x0).abs();
+        let dy = -(y1 - y0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        let (mut x, mut y) = (x0, y0);
+        loop {
+            if x >= 0 && y >= 0 {
+                out.push((x as usize, y as usize));
+            }
+            if x == x1 && y == y1 {
+                break;
+            }
+            let e2 = 2 * err;
+            if e2 >= dy {
+                err += dy;
+                x += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y += sy;
+            }
+        }
+        out
+    }
+
+    fn rect_pixels(x0: usize, y0: usize, x1: usize, y1: usize) -> Vec<(usize, usize)> {
+        let (x_min, x_max) = if x0 < x1 { (x0, x1) } else { (x1, x0) };
+        let (y_min, y_max) = if y0 < y1 { (y0, y1) } else { (y1, y0) };
+        let mut out = Vec::new();
+        for x in x_min..=x_max {
+            out.push((x, y_min));
+            out.push((x, y_max));
+        }
+        for y in y_min..=y_max {
+            out.push((x_min, y));
+            out.push((x_max, y));
+        }
+        out
+    }
+
+    fn circle_pixels(cx: isize, cy: isize, r: isize) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut x: isize = 0;
+        let mut y = r;
+        let mut d = 1 - r;
+        while x <= y {
+            for (px, py) in [
+                (cx + x, cy + y),
+                (cx - x, cy + y),
+                (cx + x, cy - y),
+                (cx - x, cy - y),
+                (cx + y, cy + x),
+                (cx - y, cy + x),
+                (cx + y, cy - x),
+                (cx - y, cy - x),
+            ] {
+                if px >= 0 && py >= 0 {
+                    out.push((px as usize, py as usize));
+                }
+            }
+            if d < 0 {
+                d += 2 * x + 3;
+            } else {
+                d += 2 * (x - y) + 5;
+                y -= 1;
+            }
+            x += 1;
+        }
+        out
+    }
+
+    fn duplicate_layer(&mut self, idx: usize) {
+        self.push_history();
+        let cf = self.current_frame;
+        let frame = &mut self.frames[cf];
+        let mut copy = frame.layers[idx].clone();
+        copy.name = format!("{} (copie)", copy.name);
+        frame.layers.insert(idx + 1, copy);
+        frame.active_layer = idx + 1;
+        self.texture_dirty = true;
+    }
+
+    fn move_layer_up(&mut self, idx: usize) {
+        let cf = self.current_frame;
+        if idx + 1 < self.frames[cf].layers.len() {
+            self.push_history();
+            let frame = &mut self.frames[cf];
+            frame.layers.swap(idx, idx + 1);
+            if frame.active_layer == idx {
+                frame.active_layer = idx + 1;
+            } else if frame.active_layer == idx + 1 {
+                frame.active_layer = idx;
+            }
+            self.texture_dirty = true;
+        }
+    }
+
+    fn move_layer_down(&mut self, idx: usize) {
+        if idx > 0 {
+            self.push_history();
+            let frame = &mut self.frames[self.current_frame];
+            frame.layers.swap(idx, idx - 1);
+            if frame.active_layer == idx {
+                frame.active_layer = idx - 1;
+            } else if frame.active_layer == idx - 1 {
+                frame.active_layer = idx;
+            }
+            self.texture_dirty = true;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Format projet .drawmepix + auto-save
+    // -----------------------------------------------------------------------
+
+    fn to_project(&self) -> Project {
+        Project {
+            version: PROJECT_VERSION,
+            width: self.frames_width,
+            height: self.frames_height,
+            fps: self.fps,
+            current_frame: self.current_frame,
+            frames: self
+                .frames
+                .iter()
+                .map(|f| ProjectFrame {
+                    active_layer: f.active_layer,
+                    layers: f
+                        .layers
+                        .iter()
+                        .map(|l| ProjectLayer {
+                            name: l.name.clone(),
+                            visible: l.visible,
+                            opacity: l.opacity,
+                            pixels: l
+                                .pixels
+                                .iter()
+                                .map(|row| row.iter().map(|c| color_to_array(*c)).collect())
+                                .collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            custom_palette: self
+                .custom_palette
+                .iter()
+                .map(|c| color_to_array(*c))
+                .collect(),
+        }
+    }
+
+    fn from_project(&mut self, p: Project) {
+        self.frames_width = p.width;
+        self.frames_height = p.height;
+        self.fps = p.fps;
+        self.frames = p
+            .frames
+            .into_iter()
+            .map(|pf| Frame {
+                active_layer: pf.active_layer,
+                layers: pf
+                    .layers
+                    .into_iter()
+                    .map(|pl| Layer {
+                        name: pl.name,
+                        visible: pl.visible,
+                        opacity: pl.opacity,
+                        pixels: pl
+                            .pixels
+                            .into_iter()
+                            .map(|row| row.into_iter().map(array_to_color).collect())
+                            .collect(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        self.current_frame = p.current_frame.min(self.frames.len().saturating_sub(1));
+        self.custom_palette = p.custom_palette.into_iter().map(array_to_color).collect();
+        self.history.clear();
+        self.redo_stack.clear();
+        self.zoom = 1.0;
+        self.hovered_cell = None;
+        self.texture_dirty = true;
+        self.dirty = false;
+    }
+
+    fn save_project(&mut self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        let project = self.to_project();
+        let bytes = bincode::serialize(&project)?;
+        std::fs::write(path, bytes)?;
+        self.current_project_path = Some(path.to_path_buf());
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn load_project(&mut self, path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+        let bytes = std::fs::read(path)?;
+        let project: Project = bincode::deserialize(&bytes)?;
+        if project.version != PROJECT_VERSION {
+            return Err(format!(
+                "Version de projet non supportée : {} (attendu {})",
+                project.version, PROJECT_VERSION
+            )
+            .into());
+        }
+        self.from_project(project);
+        self.current_project_path = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    fn autosave_path(&self) -> PathBuf {
+        match &self.current_project_path {
+            Some(p) => {
+                let mut s = p.clone();
+                let name = format!(
+                    "{}.autosave",
+                    p.file_name().and_then(|n| n.to_str()).unwrap_or("project")
+                );
+                s.set_file_name(name);
+                s
+            }
+            None => std::env::temp_dir().join("drawmepix_autosave.drawmepix"),
+        }
+    }
+
+    fn autosave(&mut self) {
+        let path = self.autosave_path();
+        let project = self.to_project();
+        match bincode::serialize(&project) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(&path, bytes) {
+                    self.last_status = Some(format!("Auto-save KO : {}", e));
+                } else {
+                    self.last_status = Some(format!("Auto-save : {}", path.display()));
+                }
+            }
+            Err(e) => {
+                self.last_status = Some(format!("Auto-save KO : {}", e));
+            }
+        }
+    }
 }
 
 impl eframe::App for DrawMePixApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // === Auto-save toutes les AUTOSAVE_INTERVAL_SECS si modifs ===
+        let now_time = ctx.input(|i| i.time);
+        if self.dirty && now_time - self.last_autosave_time >= AUTOSAVE_INTERVAL_SECS {
+            self.autosave();
+            self.last_autosave_time = now_time;
+        }
+
         // === Lecture automatique des frames ===
         if self.is_playing && self.frames.len() > 1 {
             let now = ctx.input(|i| i.time);
@@ -776,15 +1070,32 @@ impl eframe::App for DrawMePixApp {
             self.selection = Some((0, 0, self.frames_width - 1, self.frames_height - 1));
         }
 
+        let cursor_pos = ctx.input(|i| i.pointer.hover_pos());
+
+        // Pinch trackpad
         let zoom_delta = ctx.input(|i| i.zoom_delta());
         if (zoom_delta - 1.0).abs() > 0.001 {
-            self.zoom = (self.zoom * zoom_delta).clamp(MIN_ZOOM, MAX_ZOOM);
+            let old_zoom = self.zoom;
+            let new_zoom = (self.zoom * zoom_delta).clamp(MIN_ZOOM, MAX_ZOOM);
+            if let Some(mouse) = cursor_pos {
+                self.pending_zoom_focus = Some((mouse, old_zoom, new_zoom));
+            }
+            self.zoom = new_zoom;
         }
 
+        // Cmd + molette
         let (cmd_down, scroll_y) = ctx.input(|i| (i.modifiers.command, i.raw_scroll_delta.y));
         if cmd_down && scroll_y.abs() > 0.1 {
+            let old_zoom = self.zoom;
             let factor = (scroll_y * 0.005).exp();
-            self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+            let new_zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+            if let Some(mouse) = cursor_pos {
+                self.pending_zoom_focus = Some((mouse, old_zoom, new_zoom));
+                println!("zoom: mouse={:?} old={} new={}", mouse, old_zoom, new_zoom);
+            } else {
+                println!("zoom sans curseur");
+            }
+            self.zoom = new_zoom;
         }
 
         // === Barre de menu en haut ===
@@ -831,6 +1142,44 @@ impl eframe::App for DrawMePixApp {
                         ui.close_menu();
                     }
                     ui.separator();
+                    if ui.button("Sauvegarder le projet… (.drawmepix)").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Projet DrawMePix", &["drawmepix"])
+                            .set_file_name("projet.drawmepix")
+                            .save_file()
+                        {
+                            match self.save_project(&path) {
+                                Ok(()) => {
+                                    self.last_status =
+                                        Some(format!("Projet sauvegardé : {}", path.display()));
+                                }
+                                Err(e) => {
+                                    self.last_status =
+                                        Some(format!("Erreur sauvegarde projet : {}", e));
+                                }
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Ouvrir un projet… (.drawmepix)").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Projet DrawMePix", &["drawmepix"])
+                            .pick_file()
+                        {
+                            match self.load_project(&path) {
+                                Ok(()) => {
+                                    self.last_status =
+                                        Some(format!("Projet chargé : {}", path.display()));
+                                }
+                                Err(e) => {
+                                    self.last_status =
+                                        Some(format!("Erreur ouverture projet : {}", e));
+                                }
+                            }
+                        }
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Quitter").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -854,6 +1203,11 @@ impl eframe::App for DrawMePixApp {
                 });
 
                 ui.menu_button("Édition", |ui| {
+                    ui.separator();
+                    ui.checkbox(
+                        &mut self.keep_selection_on_tool_change,
+                        "Garder la sélection en changeant d'outil",
+                    );
                     if ui
                         .add_enabled(
                             !self.history.is_empty(),
@@ -1071,16 +1425,72 @@ impl eframe::App for DrawMePixApp {
                 }
 
                 ui.separator();
+                ui.label("Boutons");
+                ui.horizontal(|ui| {
+                    let has_sel = self.selection.is_some();
+                    let has_clip = self.clipboard.is_some();
+                    if ui
+                        .add_enabled(has_sel, egui::Button::new("Couper"))
+                        .clicked()
+                    {
+                        self.cut_selection();
+                    }
+                    if ui
+                        .add_enabled(has_sel, egui::Button::new("Copier"))
+                        .clicked()
+                    {
+                        self.copy_selection();
+                    }
+                    if ui
+                        .add_enabled(has_clip, egui::Button::new("Coller"))
+                        .clicked()
+                    {
+                        let (dx, dy) = self.selection.map(|s| (s.0, s.1)).unwrap_or((0, 0));
+                        self.paste_at(dx, dy);
+                    }
+                });
+
+                ui.separator();
                 ui.label("Outil");
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tool, Tool::Brush, "Pinceau");
-                    ui.selectable_value(&mut self.tool, Tool::Bucket, "Pot");
+                    if ui
+                        .selectable_label(self.tool == Tool::Brush, "Pinceau")
+                        .clicked()
+                    {
+                        self.set_tool(Tool::Brush);
+                    }
+                    if ui
+                        .selectable_label(self.tool == Tool::Bucket, "Pot")
+                        .clicked()
+                    {
+                        self.set_tool(Tool::Bucket);
+                    }
                 });
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tool, Tool::Line, "Ligne");
-                    ui.selectable_value(&mut self.tool, Tool::Rect, "Carré");
-                    ui.selectable_value(&mut self.tool, Tool::Circle, "Cercle");
-                    ui.selectable_value(&mut self.tool, Tool::Select, "Sélectionner");
+                    if ui
+                        .selectable_label(self.tool == Tool::Line, "Ligne")
+                        .clicked()
+                    {
+                        self.set_tool(Tool::Line);
+                    }
+                    if ui
+                        .selectable_label(self.tool == Tool::Rect, "Carré")
+                        .clicked()
+                    {
+                        self.set_tool(Tool::Rect);
+                    }
+                    if ui
+                        .selectable_label(self.tool == Tool::Circle, "Cercle")
+                        .clicked()
+                    {
+                        self.set_tool(Tool::Circle);
+                    }
+                    if ui
+                        .selectable_label(self.tool == Tool::Select, "Sélectionner")
+                        .clicked()
+                    {
+                        self.set_tool(Tool::Select);
+                    }
                 });
                 ui.separator();
                 ui.label("Taille du pinceau");
@@ -1140,6 +1550,7 @@ impl eframe::App for DrawMePixApp {
             if create_now {
                 self.create_new_canvas(self.new_grid_width_input, self.new_grid_height_input);
                 self.show_new_dialog = false;
+                self.selection = None;
             }
             if !keep_open {
                 self.show_new_dialog = false;
@@ -1159,6 +1570,9 @@ impl eframe::App for DrawMePixApp {
 
                 let mut dirty = false;
                 let mut to_delete: Option<usize> = None;
+                let mut to_duplicate: Option<usize> = None;
+                let mut to_move_up: Option<usize> = None;
+                let mut to_move_down: Option<usize> = None;
                 let mut new_active: Option<usize> = None;
 
                 let frame_idx = self.current_frame;
@@ -1174,10 +1588,40 @@ impl eframe::App for DrawMePixApp {
                             dirty = true;
                         }
                         let is_active = i == active_layer;
-                        let name = self.frames[frame_idx].layers[i].name.clone();
-                        if ui.selectable_label(is_active, &name).clicked() {
-                            new_active = Some(i);
+                        let name_resp = if self.renaming_layer == Some(i) {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(
+                                    &mut self.frames[frame_idx].layers[i].name,
+                                )
+                                .desired_width(100.0),
+                            );
+                            if r.lost_focus() || ui.input(|inp| inp.key_pressed(egui::Key::Enter)) {
+                                self.renaming_layer = None;
+                            }
+                            r
+                        } else {
+                            let name = self.frames[frame_idx].layers[i].name.clone();
+                            let r = ui.selectable_label(is_active, &name);
+                            if r.clicked() {
+                                new_active = Some(i);
+                            }
+                            if r.double_clicked() {
+                                self.renaming_layer = Some(i);
+                            }
+                            r
+                        };
+                        let _ = name_resp;
+                        if ui.small_button("Dupliquer").clicked() {
+                            to_duplicate = Some(i);
                         }
+                        // Boutons monter / descendre
+                        if i < layer_count - 1 && ui.small_button("⬆").clicked() {
+                            to_move_up = Some(i);
+                        }
+                        if i > 0 && ui.small_button("⬇").clicked() {
+                            to_move_down = Some(i);
+                        }
+
                         if layer_count > 1 && ui.small_button("🗑").clicked() {
                             to_delete = Some(i);
                         }
@@ -1204,8 +1648,21 @@ impl eframe::App for DrawMePixApp {
                     self.remove_layer(idx);
                     dirty = true;
                 }
+                if let Some(idx) = to_duplicate {
+                    self.duplicate_layer(idx);
+                    dirty = true;
+                }
+                if let Some(idx) = to_move_up {
+                    self.move_layer_up(idx);
+                    dirty = true;
+                }
+                if let Some(idx) = to_move_down {
+                    self.move_layer_down(idx);
+                    dirty = true;
+                }
                 if dirty {
                     self.texture_dirty = true;
+                    self.dirty = true;
                 }
             });
 
@@ -1314,255 +1771,303 @@ impl eframe::App for DrawMePixApp {
 
         // === Zone centrale : canvas ===
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::both()
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    let max_dim = self.frames_width.max(self.frames_height) as f32;
-                    let base_pixel_size = (MAX_CANVAS_SIZE / max_dim).floor().max(1.0);
-                    let pixel_size = (base_pixel_size * self.zoom).max(1.0);
+            // Compensation du zoom AVANT la ScrollArea
+            let mut force_offset = false;
+            if let Some((mouse, old_z, new_z)) = self.pending_zoom_focus.take() {
+                if let Some(canvas_min) = self.last_canvas_min {
+                    let scale = new_z / old_z;
+                    let rel = mouse - canvas_min;
+                    let delta = rel * (scale - 1.0);
+                    self.scroll_offset += delta;
+                    force_offset = true;
+                }
+            }
 
-                    let canvas_size = egui::vec2(
-                        self.frames_width as f32 * pixel_size,
-                        self.frames_height as f32 * pixel_size,
+            let mut scroll_area = egui::ScrollArea::both().auto_shrink([false; 2]);
+            if force_offset {
+                scroll_area = scroll_area.scroll_offset(self.scroll_offset);
+            }
+
+            let output = scroll_area.show(ui, |ui| {
+                let max_dim = self.frames_width.max(self.frames_height) as f32;
+                let base_pixel_size = (MAX_CANVAS_SIZE / max_dim).floor().max(1.0);
+                let pixel_size = (base_pixel_size * self.zoom).max(1.0);
+
+                let canvas_size = egui::vec2(
+                    self.frames_width as f32 * pixel_size,
+                    self.frames_height as f32 * pixel_size,
+                );
+                let (response, painter) =
+                    ui.allocate_painter(canvas_size, egui::Sense::click_and_drag());
+                let canvas_rect = response.rect;
+
+                self.last_canvas_min = Some(canvas_rect.min);
+
+                // Damier d'arrière-plan
+                {
+                    const CHECKER_LIGHT: egui::Color32 = egui::Color32::from_rgb(220, 220, 220);
+                    const CHECKER_DARK: egui::Color32 = egui::Color32::from_rgb(180, 180, 180);
+                    let visible = ui.clip_rect();
+                    let sx = (((visible.min.x - canvas_rect.min.x) / pixel_size).floor() as i32)
+                        .max(0) as usize;
+                    let sy = (((visible.min.y - canvas_rect.min.y) / pixel_size).floor() as i32)
+                        .max(0) as usize;
+                    let ex = (((visible.max.x - canvas_rect.min.x) / pixel_size).ceil() as i32)
+                        .max(0) as usize;
+                    let ey = (((visible.max.y - canvas_rect.min.y) / pixel_size).ceil() as i32)
+                        .max(0) as usize;
+                    let ex = ex.min(self.frames_width);
+                    let ey = ey.min(self.frames_height);
+                    for y in sy..ey {
+                        for x in sx..ex {
+                            let p = canvas_rect.min
+                                + egui::vec2(x as f32 * pixel_size, y as f32 * pixel_size);
+                            let r =
+                                egui::Rect::from_min_size(p, egui::vec2(pixel_size, pixel_size));
+                            let checker = if (x + y) % 2 == 0 {
+                                CHECKER_LIGHT
+                            } else {
+                                CHECKER_DARK
+                            };
+                            painter.rect_filled(r, 0.0, checker);
+                        }
+                    }
+                }
+
+                // Texture (composite des calques visibles)
+                if self.texture_dirty || self.canvas_texture.is_none() {
+                    self.rebuild_canvas_texture(ctx);
+                }
+                if let Some(tex) = &self.canvas_texture {
+                    painter.image(
+                        tex.id(),
+                        canvas_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
                     );
-                    let (response, painter) =
-                        ui.allocate_painter(canvas_size, egui::Sense::click_and_drag());
-                    let canvas_rect = response.rect;
+                }
 
-                    // Damier d'arrière-plan
-                    {
-                        const CHECKER_LIGHT: egui::Color32 = egui::Color32::from_rgb(220, 220, 220);
-                        const CHECKER_DARK: egui::Color32 = egui::Color32::from_rgb(180, 180, 180);
-                        let visible = ui.clip_rect();
-                        let sx = (((visible.min.x - canvas_rect.min.x) / pixel_size).floor() as i32)
-                            .max(0) as usize;
-                        let sy = (((visible.min.y - canvas_rect.min.y) / pixel_size).floor() as i32)
-                            .max(0) as usize;
-                        let ex = (((visible.max.x - canvas_rect.min.x) / pixel_size).ceil() as i32)
-                            .max(0) as usize;
-                        let ey = (((visible.max.y - canvas_rect.min.y) / pixel_size).ceil() as i32)
-                            .max(0) as usize;
-                        let ex = ex.min(self.frames_width);
-                        let ey = ey.min(self.frames_height);
-                        for y in sy..ey {
-                            for x in sx..ex {
-                                let p = canvas_rect.min
-                                    + egui::vec2(x as f32 * pixel_size, y as f32 * pixel_size);
-                                let r = egui::Rect::from_min_size(
-                                    p,
-                                    egui::vec2(pixel_size, pixel_size),
-                                );
-                                let checker = if (x + y) % 2 == 0 {
-                                    CHECKER_LIGHT
-                                } else {
-                                    CHECKER_DARK
-                                };
-                                painter.rect_filled(r, 0.0, checker);
-                            }
+                // Preview live des formes (Line / Rect / Circle)
+                if let (Some(start), Some(current)) = (self.shape_start, self.shape_current) {
+                    let pixels: Vec<(usize, usize)> = match self.tool {
+                        Tool::Line => Self::bresenham_pixels(
+                            start.0 as isize,
+                            start.1 as isize,
+                            current.0 as isize,
+                            current.1 as isize,
+                        ),
+                        Tool::Rect => Self::rect_pixels(start.0, start.1, current.0, current.1),
+                        Tool::Circle => {
+                            let dx = current.0 as isize - start.0 as isize;
+                            let dy = current.1 as isize - start.1 as isize;
+                            let r = ((dx * dx + dy * dy) as f32).sqrt() as isize;
+                            Self::circle_pixels(start.0 as isize, start.1 as isize, r)
+                        }
+                        _ => vec![],
+                    };
+                    let preview_color = self.current_color.gamma_multiply(0.6);
+                    for (px, py) in pixels {
+                        if px >= self.frames_width || py >= self.frames_height {
+                            continue;
+                        }
+                        let p = canvas_rect.min
+                            + egui::vec2(px as f32 * pixel_size, py as f32 * pixel_size);
+                        let r = egui::Rect::from_min_size(p, egui::vec2(pixel_size, pixel_size));
+                        painter.rect_filled(r, 0.0, preview_color);
+                    }
+                }
+
+                // Hover
+                if let Some((hx, hy)) = self.hovered_cell {
+                    let hover_pos = canvas_rect.min
+                        + egui::vec2(hx as f32 * pixel_size, hy as f32 * pixel_size);
+                    let hover_rect =
+                        egui::Rect::from_min_size(hover_pos, egui::vec2(pixel_size, pixel_size));
+                    painter.rect_stroke(
+                        hover_rect,
+                        0.0,
+                        egui::Stroke::new(1.0, egui::Color32::BLACK),
+                    );
+                }
+
+                // Grille
+                if self.show_grid && pixel_size > 6.0 {
+                    let visible = ui.clip_rect();
+                    let sx = (((visible.min.x - canvas_rect.min.x) / pixel_size).floor() as i32)
+                        .max(0) as usize;
+                    let sy = (((visible.min.y - canvas_rect.min.y) / pixel_size).floor() as i32)
+                        .max(0) as usize;
+                    let ex = (((visible.max.x - canvas_rect.min.x) / pixel_size).ceil() as i32)
+                        .max(0) as usize;
+                    let ey = (((visible.max.y - canvas_rect.min.y) / pixel_size).ceil() as i32)
+                        .max(0) as usize;
+                    let ex = ex.min(self.frames_width);
+                    let ey = ey.min(self.frames_height);
+                    let stroke = egui::Stroke::new(0.5, egui::Color32::from_gray(220));
+                    for y in sy..ey {
+                        for x in sx..ex {
+                            let p = canvas_rect.min
+                                + egui::vec2(x as f32 * pixel_size, y as f32 * pixel_size);
+                            let r =
+                                egui::Rect::from_min_size(p, egui::vec2(pixel_size, pixel_size));
+                            painter.rect_stroke(r, 0.0, stroke);
                         }
                     }
+                }
 
-                    // Texture (composite des calques visibles)
-                    if self.texture_dirty || self.canvas_texture.is_none() {
-                        self.rebuild_canvas_texture(ctx);
-                    }
-                    if let Some(tex) = &self.canvas_texture {
-                        painter.image(
-                            tex.id(),
-                            canvas_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
-                    }
+                // Sélection
+                if let Some((x0, y0, x1, y1)) = self.selection {
+                    let sel_pos = canvas_rect.min
+                        + egui::vec2(x0 as f32 * pixel_size, y0 as f32 * pixel_size);
+                    let sel_size = egui::vec2(
+                        (x1 - x0 + 1) as f32 * pixel_size,
+                        (y1 - y0 + 1) as f32 * pixel_size,
+                    );
+                    painter.rect_stroke(
+                        egui::Rect::from_min_size(sel_pos, sel_size),
+                        0.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 150, 255)),
+                    );
+                }
 
-                    // Hover
-                    if let Some((hx, hy)) = self.hovered_cell {
-                        let hover_pos = canvas_rect.min
-                            + egui::vec2(hx as f32 * pixel_size, hy as f32 * pixel_size);
-                        let hover_rect = egui::Rect::from_min_size(
-                            hover_pos,
-                            egui::vec2(pixel_size, pixel_size),
-                        );
-                        painter.rect_stroke(
-                            hover_rect,
-                            0.0,
-                            egui::Stroke::new(1.0, egui::Color32::BLACK),
-                        );
-                    }
-
-                    // Grille
-                    if self.show_grid && pixel_size > 6.0 {
-                        let visible = ui.clip_rect();
-                        let sx = (((visible.min.x - canvas_rect.min.x) / pixel_size).floor() as i32)
-                            .max(0) as usize;
-                        let sy = (((visible.min.y - canvas_rect.min.y) / pixel_size).floor() as i32)
-                            .max(0) as usize;
-                        let ex = (((visible.max.x - canvas_rect.min.x) / pixel_size).ceil() as i32)
-                            .max(0) as usize;
-                        let ey = (((visible.max.y - canvas_rect.min.y) / pixel_size).ceil() as i32)
-                            .max(0) as usize;
-                        let ex = ex.min(self.frames_width);
-                        let ey = ey.min(self.frames_height);
-                        let stroke = egui::Stroke::new(0.5, egui::Color32::from_gray(220));
-                        for y in sy..ey {
-                            for x in sx..ex {
-                                let p = canvas_rect.min
-                                    + egui::vec2(x as f32 * pixel_size, y as f32 * pixel_size);
-                                let r = egui::Rect::from_min_size(
-                                    p,
-                                    egui::vec2(pixel_size, pixel_size),
-                                );
-                                painter.rect_stroke(r, 0.0, stroke);
-                            }
-                        }
-                    }
-
-                    // Sélection
-                    if let Some((x0, y0, x1, y1)) = self.selection {
-                        let sel_pos = canvas_rect.min
-                            + egui::vec2(x0 as f32 * pixel_size, y0 as f32 * pixel_size);
-                        let sel_size = egui::vec2(
-                            (x1 - x0 + 1) as f32 * pixel_size,
-                            (y1 - y0 + 1) as f32 * pixel_size,
-                        );
-                        painter.rect_stroke(
-                            egui::Rect::from_min_size(sel_pos, sel_size),
-                            0.0,
-                            egui::Stroke::new(2.0, egui::Color32::from_rgb(0, 150, 255)),
-                        );
-                    }
-
-                    // Hover detection
-                    self.hovered_cell = response.hover_pos().and_then(|pos| {
-                        let rel = pos - canvas_rect.min;
-                        let x = (rel.x / pixel_size) as usize;
-                        let y = (rel.y / pixel_size) as usize;
-                        if x < self.frames_width && y < self.frames_height {
-                            Some((x, y))
-                        } else {
-                            None
-                        }
-                    });
-
-                    // Pan / Peinture / Formes / Sélection
-                    let middle_down = ctx.input(|i| i.pointer.middle_down());
-                    if middle_down {
-                        let delta = ctx.input(|i| i.pointer.delta());
-                        ui.scroll_with_delta(-delta);
-                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                        self.is_drawing = false;
-                        self.last_paint_cell = None;
+                // Hover detection
+                self.hovered_cell = response.hover_pos().and_then(|pos| {
+                    let rel = pos - canvas_rect.min;
+                    let x = (rel.x / pixel_size) as usize;
+                    let y = (rel.y / pixel_size) as usize;
+                    if x < self.frames_width && y < self.frames_height {
+                        Some((x, y))
                     } else {
-                        let drag_started = response.drag_started();
-                        let drag_released = response.drag_stopped();
-                        let pressed = response.is_pointer_button_down_on();
+                        None
+                    }
+                });
 
-                        if let Some(pos) = response.interact_pointer_pos() {
-                            let rel = pos - canvas_rect.min;
-                            let cx = (rel.x / pixel_size) as usize;
-                            let cy = (rel.y / pixel_size) as usize;
+                // Pan / Peinture / Formes / Sélection
+                let middle_down = ctx.input(|i| i.pointer.middle_down());
+                if middle_down {
+                    let delta = ctx.input(|i| i.pointer.delta());
+                    ui.scroll_with_delta(-delta);
+                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    self.is_drawing = false;
+                    self.last_paint_cell = None;
+                } else {
+                    let drag_started = response.drag_started();
+                    let drag_released = response.drag_stopped();
+                    let pressed = response.is_pointer_button_down_on();
 
-                            if cx < self.frames_width && cy < self.frames_height {
-                                let alt_pressed = ctx.input(|i| i.modifiers.alt);
-                                let right_pressed = ctx.input(|i| i.pointer.secondary_down());
-                                let color = if right_pressed {
-                                    egui::Color32::TRANSPARENT
-                                } else {
-                                    self.current_color
-                                };
+                    if let Some(pos) = response.interact_pointer_pos() {
+                        let rel = pos - canvas_rect.min;
+                        let cx = (rel.x / pixel_size) as usize;
+                        let cy = (rel.y / pixel_size) as usize;
 
-                                if alt_pressed && pressed {
-                                    // Pipette : on prend la couleur visible (flatten)
-                                    let flat = self.frames[self.current_frame]
-                                        .flatten(self.frames_width, self.frames_height);
-                                    let c = flat[cy][cx];
-                                    self.current_color = c;
-                                    self.remember_color(c);
-                                } else {
-                                    match self.tool {
-                                        Tool::Brush => {
-                                            if pressed {
-                                                if !self.is_drawing {
-                                                    self.push_history();
-                                                    self.is_drawing = true;
-                                                    self.last_paint_cell = None;
-                                                }
-                                                if let Some((px, py)) = self.last_paint_cell {
-                                                    self.paint_line(px, py, cx, cy, color);
-                                                }
-                                                self.paint_brush(cx, cy, color);
-                                                self.last_paint_cell = Some((cx, cy));
-                                            }
-                                        }
-                                        Tool::Bucket => {
-                                            if pressed && !self.is_drawing {
+                        if cx < self.frames_width && cy < self.frames_height {
+                            let alt_pressed = ctx.input(|i| i.modifiers.alt);
+                            let right_pressed = ctx.input(|i| i.pointer.secondary_down());
+                            let color = if right_pressed {
+                                egui::Color32::TRANSPARENT
+                            } else {
+                                self.current_color
+                            };
+
+                            if right_pressed && self.tool == Tool::Brush {
+                                ctx.set_cursor_icon(egui::CursorIcon::NotAllowed);
+                            }
+
+                            if alt_pressed && pressed {
+                                let flat = self.frames[self.current_frame]
+                                    .flatten(self.frames_width, self.frames_height);
+                                let c = flat[cy][cx];
+                                self.current_color = c;
+                                self.remember_color(c);
+                            } else {
+                                match self.tool {
+                                    Tool::Brush => {
+                                        if pressed {
+                                            if !self.is_drawing {
                                                 self.push_history();
                                                 self.is_drawing = true;
-                                                self.flood_fill(cx, cy, color);
+                                                self.last_paint_cell = None;
+                                            }
+                                            if let Some((px, py)) = self.last_paint_cell {
+                                                self.paint_line(px, py, cx, cy, color);
+                                            }
+                                            self.paint_brush(cx, cy, color);
+                                            self.last_paint_cell = Some((cx, cy));
+                                        }
+                                    }
+                                    Tool::Bucket => {
+                                        if pressed && !self.is_drawing {
+                                            self.push_history();
+                                            self.is_drawing = true;
+                                            self.flood_fill(cx, cy, color);
+                                        }
+                                    }
+                                    Tool::Select => {
+                                        if drag_started {
+                                            self.shape_start = Some((cx, cy));
+                                        }
+                                        if drag_released {
+                                            if let Some((x0, y0)) = self.shape_start.take() {
+                                                let (x_min, x_max) =
+                                                    if x0 < cx { (x0, cx) } else { (cx, x0) };
+                                                let (y_min, y_max) =
+                                                    if y0 < cy { (y0, cy) } else { (cy, y0) };
+                                                self.selection = Some((x_min, y_min, x_max, y_max));
+                                                self.last_status = Some(format!(
+                                                    "Sélection {}×{}",
+                                                    x_max - x_min + 1,
+                                                    y_max - y_min + 1
+                                                ));
                                             }
                                         }
-                                        Tool::Select => {
-                                            if drag_started {
-                                                self.shape_start = Some((cx, cy));
-                                            }
-                                            if drag_released {
-                                                if let Some((x0, y0)) = self.shape_start.take() {
-                                                    let (x_min, x_max) =
-                                                        if x0 < cx { (x0, cx) } else { (cx, x0) };
-                                                    let (y_min, y_max) =
-                                                        if y0 < cy { (y0, cy) } else { (cy, y0) };
-                                                    self.selection =
-                                                        Some((x_min, y_min, x_max, y_max));
-                                                    self.last_status = Some(format!(
-                                                        "Sélection {}×{}",
-                                                        x_max - x_min + 1,
-                                                        y_max - y_min + 1
-                                                    ));
-                                                }
-                                            }
+                                    }
+                                    Tool::Line | Tool::Rect | Tool::Circle => {
+                                        if drag_started {
+                                            self.shape_start = Some((cx, cy));
+                                            self.push_history();
                                         }
-                                        Tool::Line | Tool::Rect | Tool::Circle => {
-                                            if drag_started {
-                                                self.shape_start = Some((cx, cy));
-                                                self.push_history();
-                                            }
-                                            if drag_released {
-                                                if let Some((x0, y0)) = self.shape_start.take() {
-                                                    match self.tool {
-                                                        Tool::Line => self.draw_line(
-                                                            x0 as isize,
-                                                            y0 as isize,
-                                                            cx as isize,
-                                                            cy as isize,
-                                                            color,
-                                                        ),
-                                                        Tool::Rect => {
-                                                            self.draw_rect(x0, y0, cx, cy, color)
-                                                        }
-                                                        Tool::Circle => {
-                                                            let dx = cx as isize - x0 as isize;
-                                                            let dy = cy as isize - y0 as isize;
-                                                            let r = ((dx * dx + dy * dy) as f32)
-                                                                .sqrt()
-                                                                as usize;
-                                                            self.draw_circle(x0, y0, r, color);
-                                                        }
-                                                        _ => {}
+                                        if pressed {
+                                            self.shape_current = Some((cx, cy));
+                                        }
+                                        if drag_released {
+                                            if let Some((x0, y0)) = self.shape_start.take() {
+                                                match self.tool {
+                                                    Tool::Line => self.draw_line(
+                                                        x0 as isize,
+                                                        y0 as isize,
+                                                        cx as isize,
+                                                        cy as isize,
+                                                        color,
+                                                    ),
+                                                    Tool::Rect => {
+                                                        self.draw_rect(x0, y0, cx, cy, color)
                                                     }
+                                                    Tool::Circle => {
+                                                        let dx = cx as isize - x0 as isize;
+                                                        let dy = cy as isize - y0 as isize;
+                                                        let r = ((dx * dx + dy * dy) as f32).sqrt()
+                                                            as usize;
+                                                        self.draw_circle(x0, y0, r, color);
+                                                    }
+                                                    _ => {}
                                                 }
+                                                self.shape_current = None;
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-
-                        if !pressed {
-                            self.is_drawing = false;
-                            self.last_paint_cell = None;
-                        }
                     }
-                });
+
+                    if !pressed {
+                        self.is_drawing = false;
+                        self.last_paint_cell = None;
+                    }
+                }
+            });
+
+            self.scroll_offset = output.state.offset;
         });
     }
 }
