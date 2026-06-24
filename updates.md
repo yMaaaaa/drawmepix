@@ -3,6 +3,37 @@
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 Ordre antichronologique : version la plus récente en haut.
 
+## [1.5.0] — 2026-06-24
+
+### Ajouté
+- **Fusion de calques** : bouton « Fusionner ↓ » dans la ligne de chaque
+  calque non-bottom, qui compose le calque actif avec celui du dessous en
+  respectant les opacités et le compositing alpha, puis le supprime
+- **Déplacement de la sélection lasso** : l'outil Déplacer respecte
+  désormais le masque lasso quand il est actif — seuls les pixels
+  sélectionnés bougent, la zone source devient transparente
+- Le masque lasso suit automatiquement le contenu à sa nouvelle position
+  après un déplacement, ce qui permet d'enchaîner les opérations
+  (re-déplacement, copier-coller, couper)
+
+### Modifié
+- **`paint_pixel` respecte les masques de clipping** : quand le calque
+  actif est marqué comme clipping mask, les pixels peints hors de la
+  silhouette du calque immédiatement en dessous sont ignorés. Tous les
+  outils de dessin en héritent automatiquement (Pinceau, Gomme, Ligne,
+  Rectangle, Cercle, Texte, Copier-coller, Déplacer). Évite les
+  gribouilles invisibles qui apparaissaient à la fusion
+- **`set_tool` préserve la sélection** lors du passage sur les outils
+  Move et Eyedropper (en plus de Select et Lasso déjà couverts). Ces
+  outils ne dessinent pas, donc n'invalident plus le contexte de
+  sélection
+
+### Limitations connues
+- L'outil Pot de peinture ne respecte pas encore le clipping mask : il
+  remplit la composante connexe dans le buffer brut, donc les pixels
+  hors silhouette sont écrits même s'ils n'apparaissent pas. À corriger
+  dans une future version si le besoin se présente
+
 ## [1.4.0] — 2026-06-23
 
 ### Ajouté

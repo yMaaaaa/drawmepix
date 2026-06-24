@@ -299,6 +299,7 @@ struct DrawMePixApp {
 
     move_start: Option<(isize, isize)>,
     move_snapshot: Option<Vec<Vec<egui::Color32>>>,
+    move_lasso_snapshot: Option<Vec<Vec<bool>>>,
 
     lasso_points: Vec<(usize, usize)>,
     lasso_mask: Option<Vec<Vec<bool>>>,
@@ -383,6 +384,7 @@ impl Default for DrawMePixApp {
             onion_skin_radius: 1,
             move_start: None,
             move_snapshot: None,
+            move_lasso_snapshot: None,
             lasso_points: Vec::new(),
             lasso_mask: None,
             lasso_active_drag: false,
@@ -607,20 +609,19 @@ impl DrawMePixApp {
         let mh = self.mirror_horizontal;
         let mv = self.mirror_vertical;
         let cf = self.current_frame;
-        let frame = &mut self.frames[cf];
-        let al = frame.active_layer;
-        let pixels = &mut frame.layers[al].pixels;
-
-        pixels[y][x] = color;
+        let al = self.frames[cf].active_layer;
 
         let mirror_x = (2.0 * self.mirror_axis_x - x as f32) as isize;
         let mirror_y = (2.0 * self.mirror_axis_y - y as f32) as isize;
 
+        // Liste candidate des positions (point + miroirs)
+        let mut to_paint: Vec<(usize, usize)> = Vec::with_capacity(4);
+        to_paint.push((x, y));
         if mh && mirror_x >= 0 && (mirror_x as usize) < w {
-            pixels[y][mirror_x as usize] = color;
+            to_paint.push((mirror_x as usize, y));
         }
         if mv && mirror_y >= 0 && (mirror_y as usize) < h {
-            pixels[mirror_y as usize][x] = color;
+            to_paint.push((x, mirror_y as usize));
         }
         if mh
             && mv
@@ -629,7 +630,20 @@ impl DrawMePixApp {
             && (mirror_x as usize) < w
             && (mirror_y as usize) < h
         {
-            pixels[mirror_y as usize][mirror_x as usize] = color;
+            to_paint.push((mirror_x as usize, mirror_y as usize));
+        }
+
+        // Si le calque actif est un masque de clipping, on filtre :
+        // on ne peint que là où le calque immédiatement en dessous est opaque.
+        if al > 0 && self.frames[cf].layers[al].is_clipping_mask {
+            let below = &self.frames[cf].layers[al - 1].pixels;
+            to_paint.retain(|&(px, py)| below[py][px].a() > 0);
+        }
+
+        // Écriture
+        let pixels = &mut self.frames[cf].layers[al].pixels;
+        for (px, py) in to_paint {
+            pixels[py][px] = color;
         }
         self.texture_dirty = true;
     }
@@ -910,7 +924,12 @@ impl DrawMePixApp {
     }
 
     fn set_tool(&mut self, new_tool: Tool) {
-        if new_tool != self.tool && !matches!(new_tool, Tool::Select | Tool::Lasso) {
+        if new_tool != self.tool
+            && !matches!(
+                new_tool,
+                Tool::Select | Tool::Lasso | Tool::Move | Tool::Eyedropper
+            )
+        {
             if !self.keep_selection_on_tool_change {
                 self.selection = None;
                 self.lasso_mask = None;
@@ -1089,6 +1108,88 @@ impl DrawMePixApp {
             self.current_frame += 1;
             self.texture_dirty = true;
         }
+    }
+
+    fn merge_layer_down(&mut self, idx: usize) {
+        let cf = self.current_frame;
+        // Impossible de fusionner le calque 0 (rien en dessous)
+        if idx == 0 || self.frames[cf].layers.len() < 2 {
+            return;
+        }
+        self.push_history();
+
+        let w = self.frames_width;
+        let h = self.frames_height;
+        let frame = &mut self.frames[cf];
+
+        let lower = frame.layers[idx - 1].clone();
+        let upper = frame.layers[idx].clone();
+
+        let mut merged = vec![vec![egui::Color32::TRANSPARENT; w]; h];
+
+        // 1) Étend le calque du dessous (avec son opacity)
+        if lower.visible {
+            for y in 0..h {
+                for x in 0..w {
+                    let src = lower.pixels[y][x];
+                    if src.a() == 0 {
+                        continue;
+                    }
+                    let src_a = (src.a() as f32 / 255.0) * lower.opacity;
+                    merged[y][x] = egui::Color32::from_rgba_unmultiplied(
+                        src.r(),
+                        src.g(),
+                        src.b(),
+                        (src_a * 255.0) as u8,
+                    );
+                }
+            }
+        }
+
+        // 2) Compose le calque du dessus par-dessus (avec son opacity)
+        if upper.visible {
+            for y in 0..h {
+                for x in 0..w {
+                    let src = upper.pixels[y][x];
+                    if src.a() == 0 {
+                        continue;
+                    }
+                    let src_a = (src.a() as f32 / 255.0) * upper.opacity;
+                    let dst = merged[y][x];
+                    let dst_a = dst.a() as f32 / 255.0;
+                    let out_a = src_a + dst_a * (1.0 - src_a);
+                    if out_a == 0.0 {
+                        continue;
+                    }
+                    let blend = |s: u8, d: u8| -> u8 {
+                        let s = s as f32 / 255.0;
+                        let d = d as f32 / 255.0;
+                        (((s * src_a + d * dst_a * (1.0 - src_a)) / out_a) * 255.0) as u8
+                    };
+                    merged[y][x] = egui::Color32::from_rgba_unmultiplied(
+                        blend(src.r(), dst.r()),
+                        blend(src.g(), dst.g()),
+                        blend(src.b(), dst.b()),
+                        (out_a * 255.0) as u8,
+                    );
+                }
+            }
+        }
+
+        // 3) Remplace le calque du dessous par le résultat, supprime celui du dessus
+        frame.layers[idx - 1].pixels = merged;
+        frame.layers[idx - 1].opacity = 1.0;
+        frame.layers[idx - 1].visible = true;
+        frame.layers.remove(idx);
+
+        if frame.active_layer >= frame.layers.len() {
+            frame.active_layer = frame.layers.len() - 1;
+        } else if frame.active_layer == idx {
+            frame.active_layer = idx - 1;
+        }
+
+        self.texture_dirty = true;
+        self.last_status = Some("Calques fusionnés".to_string());
     }
 
     fn polygon_to_mask(points: &[(usize, usize)], width: usize, height: usize) -> Vec<Vec<bool>> {
@@ -2590,6 +2691,7 @@ impl eframe::App for DrawMePixApp {
                     let mut to_move_up: Option<usize> = None;
                     let mut to_move_down: Option<usize> = None;
                     let mut new_active: Option<usize> = None;
+                    let mut to_merge_down: Option<usize> = None;
 
                     let frame_idx = self.current_frame;
                     let active_layer = self.frames[frame_idx].active_layer;
@@ -2639,7 +2741,10 @@ impl eframe::App for DrawMePixApp {
                             if i > 0 && ui.small_button("⬇").clicked() {
                                 to_move_down = Some(i);
                             }
-
+                            if i > 0 && ui.small_button("Fusionner ↓").clicked() {
+                                // <-- nouveau
+                                to_merge_down = Some(i);
+                            }
                             if layer_count > 1 && ui.small_button("🗑").clicked() {
                                 to_delete = Some(i);
                             }
@@ -2685,6 +2790,10 @@ impl eframe::App for DrawMePixApp {
                     }
                     if let Some(idx) = to_move_down {
                         self.move_layer_down(idx);
+                        dirty = true;
+                    }
+                    if let Some(idx) = to_merge_down {
+                        self.merge_layer_down(idx);
                         dirty = true;
                     }
                     if dirty {
@@ -3572,11 +3681,15 @@ impl eframe::App for DrawMePixApp {
                                                 let al = self.frames[cf].active_layer;
                                                 self.move_snapshot =
                                                     Some(self.frames[cf].layers[al].pixels.clone());
+                                                // Si un lasso est actif, on snapshot aussi sa forme pour déplacer
+                                                // uniquement la sélection lasso au lieu du calque entier.
+                                                self.move_lasso_snapshot = self.lasso_mask.clone();
                                             }
                                             if pressed {
                                                 if let (Some(start), Some(snap)) =
                                                     (self.move_start, self.move_snapshot.clone())
                                                 {
+                                                    let mask_opt = self.move_lasso_snapshot.clone();
                                                     let dx = cx as isize - start.0;
                                                     let dy = cy as isize - start.1;
                                                     let cf = self.current_frame;
@@ -3585,27 +3698,91 @@ impl eframe::App for DrawMePixApp {
                                                     let fh = self.frames_height;
                                                     let pixels =
                                                         &mut self.frames[cf].layers[al].pixels;
-                                                    for y in 0..fh {
-                                                        for x in 0..fw {
-                                                            let sx = x as isize - dx;
-                                                            let sy = y as isize - dy;
-                                                            pixels[y][x] = if sx >= 0
-                                                                && sy >= 0
-                                                                && (sx as usize) < fw
-                                                                && (sy as usize) < fh
-                                                            {
-                                                                snap[sy as usize][sx as usize]
-                                                            } else {
-                                                                egui::Color32::TRANSPARENT
-                                                            };
+
+                                                    if let Some(mask) = mask_opt {
+                                                        // === Déplacement de la sélection lasso uniquement ===
+                                                        // 1) On repart du snapshot intact
+                                                        *pixels = snap.clone();
+                                                        // 2) On vide la zone source (les pixels du lasso d'origine)
+                                                        for y in 0..fh {
+                                                            for x in 0..fw {
+                                                                if mask[y][x] {
+                                                                    pixels[y][x] =
+                                                                        egui::Color32::TRANSPARENT;
+                                                                }
+                                                            }
+                                                        }
+                                                        // 3) On repose les pixels du lasso à la nouvelle position
+                                                        for y in 0..fh {
+                                                            for x in 0..fw {
+                                                                let sx = x as isize - dx;
+                                                                let sy = y as isize - dy;
+                                                                if sx >= 0
+                                                                    && sy >= 0
+                                                                    && (sx as usize) < fw
+                                                                    && (sy as usize) < fh
+                                                                    && mask[sy as usize]
+                                                                        [sx as usize]
+                                                                {
+                                                                    pixels[y][x] = snap
+                                                                        [sy as usize]
+                                                                        [sx as usize];
+                                                                }
+                                                            }
+                                                        }
+                                                    } else {
+                                                        // === Déplacement du calque entier (comportement existant) ===
+                                                        for y in 0..fh {
+                                                            for x in 0..fw {
+                                                                let sx = x as isize - dx;
+                                                                let sy = y as isize - dy;
+                                                                pixels[y][x] = if sx >= 0
+                                                                    && sy >= 0
+                                                                    && (sx as usize) < fw
+                                                                    && (sy as usize) < fh
+                                                                {
+                                                                    snap[sy as usize][sx as usize]
+                                                                } else {
+                                                                    egui::Color32::TRANSPARENT
+                                                                };
+                                                            }
                                                         }
                                                     }
                                                     self.texture_dirty = true;
                                                 }
                                             }
                                             if drag_released {
+                                                // Si on a déplacé un lasso, on met à jour le masque pour qu'il
+                                                // suive le contenu à la nouvelle position (utile pour enchaîner
+                                                // un autre déplacement, ou un copier/coller).
+                                                if let (Some(start), Some(mask)) = (
+                                                    self.move_start,
+                                                    self.move_lasso_snapshot.clone(),
+                                                ) {
+                                                    let dx = cx as isize - start.0;
+                                                    let dy = cy as isize - start.1;
+                                                    let fw = self.frames_width;
+                                                    let fh = self.frames_height;
+                                                    let mut new_mask = vec![vec![false; fw]; fh];
+                                                    for y in 0..fh {
+                                                        for x in 0..fw {
+                                                            let sx = x as isize - dx;
+                                                            let sy = y as isize - dy;
+                                                            if sx >= 0
+                                                                && sy >= 0
+                                                                && (sx as usize) < fw
+                                                                && (sy as usize) < fh
+                                                                && mask[sy as usize][sx as usize]
+                                                            {
+                                                                new_mask[y][x] = true;
+                                                            }
+                                                        }
+                                                    }
+                                                    self.lasso_mask = Some(new_mask);
+                                                }
                                                 self.move_start = None;
                                                 self.move_snapshot = None;
+                                                self.move_lasso_snapshot = None;
                                             }
                                         }
                                         Tool::Lasso => {
