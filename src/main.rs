@@ -437,10 +437,19 @@ impl DrawMePixApp {
     }
 
     fn install_update() -> Result<bool, Box<dyn std::error::Error>> {
+        let target = if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(target_os = "windows") {
+            "windows"
+        } else {
+            "linux"
+        };
+
         let status = self_update::backends::github::Update::configure()
             .repo_owner("yMaaaaa")
             .repo_name("drawmepix")
-            .bin_name("drawmepix")
+            .bin_name("DrawMePix")
+            .target(target)
             .current_version(env!("CARGO_PKG_VERSION"))
             .build()?
             .update()?;

@@ -1,6 +1,6 @@
 [package]
-name = "pixel-project"
-version = "0.1.0"
+name = "drawmepix"
+version = "1.5.0"
 edition = "2024"
 
 [dependencies]

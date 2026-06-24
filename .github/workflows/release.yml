@@ -81,8 +81,8 @@ jobs:
         if: matrix.os_name == 'linux'
         run: |
           mkdir release
-          cp "target/release/${BINARY_NAME}" release/drawmepix
-          chmod +x release/drawmepix
+          cp "target/release/${BINARY_NAME}" release/DrawMePix
+          chmod +x release/DrawMePix
           tar -czf "${{ matrix.artifact }}" -C release .
 
       - uses: softprops/action-gh-release@v2

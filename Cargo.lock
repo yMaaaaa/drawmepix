@@ -1133,6 +1133,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
+name = "drawmepix"
+version = "1.5.0"
+dependencies = [
+ "bincode",
+ "eframe",
+ "gif",
+ "image",
+ "rfd",
+ "self_update",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ecolor"
 version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3108,20 +3122,6 @@ dependencies = [
  "atomic-waker",
  "fastrand 2.4.1",
  "futures-io",
-]
-
-[[package]]
-name = "pixel-project"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "eframe",
- "gif",
- "image",
- "rfd",
- "self_update",
- "serde",
- "serde_json",
 ]
 
 [[package]]
