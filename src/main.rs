@@ -332,6 +332,9 @@ struct DrawMePixApp {
     show_preview_panel: bool,
     show_frames_panel: bool,
     font_style: FontStyle,
+
+    update_available: Option<String>,
+    show_update_modal: bool,
 }
 
 impl Default for DrawMePixApp {
@@ -411,11 +414,39 @@ impl Default for DrawMePixApp {
             show_preview_panel: true,
             show_frames_panel: true,
             font_style: FontStyle::Proportional,
+            update_available: None,
+            show_update_modal: false,
         }
     }
 }
 
 impl DrawMePixApp {
+    fn check_for_update_available() -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let releases = self_update::backends::github::ReleaseList::configure()
+            .repo_owner("yMaaaaa")
+            .repo_name("drawmepix")
+            .build()?
+            .fetch()?;
+        if let Some(latest) = releases.first() {
+            let current = env!("CARGO_PKG_VERSION");
+            if latest.version != current {
+                return Ok(Some(latest.version.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn install_update() -> Result<bool, Box<dyn std::error::Error>> {
+        let status = self_update::backends::github::Update::configure()
+            .repo_owner("yMaaaaa")
+            .repo_name("drawmepix")
+            .bin_name("drawmepix")
+            .current_version(env!("CARGO_PKG_VERSION"))
+            .build()?
+            .update()?;
+        Ok(status.updated())
+    }
+
     fn create_new_canvas(&mut self, width: usize, height: usize) {
         self.push_history();
         self.frames_width = width.clamp(4, 4096);
@@ -2110,6 +2141,21 @@ impl eframe::App for DrawMePixApp {
                         self.show_help_modal = true;
                         ui.close_menu();
                     }
+                    if ui.button("Vérifier les mises à jour").clicked() {
+                        match Self::check_for_update_available() {
+                            Ok(Some(version)) => {
+                                self.update_available = Some(version);
+                                self.show_update_modal = true;
+                            }
+                            Ok(None) => {
+                                self.last_status = Some("Tu es déjà à jour !".to_string());
+                            }
+                            Err(e) => {
+                                self.last_status = Some(format!("Erreur check : {}", e));
+                            }
+                        }
+                        ui.close_menu();
+                    }
                 });
 
                 ui.separator();
@@ -2669,6 +2715,60 @@ impl eframe::App for DrawMePixApp {
         });
             if !open {
                 self.show_help_modal = false;
+            }
+        }
+        if self.show_update_modal {
+            if let Some(version) = self.update_available.clone() {
+                let mut open = true;
+                let mut accepted = false;
+                let mut refused = false;
+                egui::Window::new("Mise à jour disponible")
+                    .open(&mut open)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        ui.label(format!(
+                            "Une nouvelle version de DrawMePix est disponible :",
+                        ));
+                        ui.add_space(8.0);
+                        ui.heading(format!("v{}", version));
+                        ui.add_space(8.0);
+                        ui.label(format!(
+                            "Tu utilises actuellement v{}.",
+                            env!("CARGO_PKG_VERSION")
+                        ));
+                        ui.add_space(12.0);
+                        ui.label("Voulez-vous l'installer maintenant ?");
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("Installer").clicked() {
+                                accepted = true;
+                            }
+                            if ui.button("Plus tard").clicked() {
+                                refused = true;
+                            }
+                        });
+                    });
+                if accepted {
+                    match Self::install_update() {
+                        Ok(true) => {
+                            self.last_status =
+                                Some("Mise à jour installée — relance DrawMePix.".to_string());
+                        }
+                        Ok(false) => {
+                            self.last_status = Some("Aucune mise à jour appliquée.".to_string());
+                        }
+                        Err(e) => {
+                            self.last_status = Some(format!("Erreur mise à jour : {}", e));
+                        }
+                    }
+                    self.show_update_modal = false;
+                    self.update_available = None;
+                }
+                if refused || !open {
+                    self.show_update_modal = false;
+                    self.update_available = None;
+                }
             }
         }
 
