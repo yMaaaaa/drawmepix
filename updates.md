@@ -3,6 +3,40 @@
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 Ordre antichronologique : version la plus récente en haut.
 
+## [1.5.1] — 2026-06-25
+
+### Ajouté
+- **Auto-update intégré** : nouveau bouton « Vérifier les mises à jour »
+  dans le menu Aide qui interroge GitHub Releases et propose d'installer
+  automatiquement la dernière version
+  - Modale de confirmation avec affichage de la version actuelle et de la
+    version disponible
+  - Téléchargement et remplacement transparent du binaire via la crate
+    `self_update`
+  - Détection automatique de la plateforme (macOS, Windows, Linux) pour
+    récupérer le bon asset
+- **Pipeline GitHub Actions** déclenché à chaque tag `v*` qui compile et
+  publie automatiquement les binaires pour macOS, Windows et Linux dans
+  la release correspondante (`.github/workflows/release.yml`)
+
+### Modifié
+- **Renommage du package** de `pixel-project` à `drawmepix` dans
+  `Cargo.toml` pour cohérence avec le nom du projet et la configuration
+  `self_update`
+- **Version Cargo.toml** alignée sur les tags Git (passe à `1.5.1`) pour
+  que `env!("CARGO_PKG_VERSION")` retourne la valeur correcte au runtime
+- Binaire Linux renommé en `DrawMePix` (au lieu de `drawmepix`) dans
+  l'archive de release pour matcher la configuration `bin_name` de
+  `self_update` sur tous les OS
+
+### Notes
+- Sur macOS, l'auto-update remplace le binaire à l'intérieur du
+  `DrawMePix.app` installé. Le bundle `.app` reste intact, seul
+  l'exécutable est mis à jour
+- Pour les utilisateurs en v1.5.0 (ou antérieure), le bouton
+  « Vérifier les mises à jour » n'existe pas — il faut télécharger
+  manuellement v1.5.1 une fois pour bénéficier ensuite de l'auto-update
+
 ## [1.5.0] — 2026-06-24
 
 ### Ajouté
