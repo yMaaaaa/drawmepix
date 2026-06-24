@@ -3,6 +3,17 @@
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 Ordre antichronologique : version la plus récente en haut.
 
+## [1.5.2] — 2026-06-25
+
+### Corrigé
+- **Pipeline GitHub Actions** : la variable `BINARY_NAME` du workflow
+  pointait toujours vers l'ancien nom de package `pixel-project`, alors
+  que le binaire est désormais produit sous le nom `drawmepix` depuis
+  la v1.5.1. L'étape de packaging (.app macOS, .zip Windows,
+  .tar.gz Linux) échouait avec un `cp: No such file or directory`
+  empêchant la création de la release. La variable est alignée sur
+  `drawmepix`
+
 ## [1.5.1] — 2026-06-25
 
 ### Ajouté
