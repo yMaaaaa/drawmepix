@@ -1619,6 +1619,67 @@ impl DrawMePixApp {
         }
     }
 
+    fn flip_horizontal_selection(&mut self) {
+        let (min_x, max_x, min_y, max_y) = match self.selection {
+            Some((x1, y1, x2, y2)) => (x1.min(x2), x1.max(x2), y1.min(y2), y1.max(y2)),
+            None => (0, self.frames_width - 1, 0, self.frames_height - 1),
+        };
+        self.push_history();
+
+        let cf = self.current_frame;
+        let al = self.frames[cf].active_layer;
+        let pixels = &mut self.frames[cf].layers[al].pixels;
+
+        // Snapshot de la zone, puis miroir colonne par colonne
+        let mut zone = vec![vec![egui::Color32::TRANSPARENT; max_x - min_x + 1]; max_y - min_y + 1];
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                zone[y - min_y][x - min_x] = pixels[y][x];
+            }
+        }
+        let width_zone = max_x - min_x;
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let zx = x - min_x;
+                let flipped_zx = width_zone - zx;
+                pixels[y][x] = zone[y - min_y][flipped_zx];
+            }
+        }
+
+        self.texture_dirty = true;
+        self.last_status = Some("Miroir horizontal appliqué".to_string());
+    }
+
+    fn flip_vertical_selection(&mut self) {
+        let (min_x, max_x, min_y, max_y) = match self.selection {
+            Some((x1, y1, x2, y2)) => (x1.min(x2), x1.max(x2), y1.min(y2), y1.max(y2)),
+            None => (0, self.frames_width - 1, 0, self.frames_height - 1),
+        };
+        self.push_history();
+
+        let cf = self.current_frame;
+        let al = self.frames[cf].active_layer;
+        let pixels = &mut self.frames[cf].layers[al].pixels;
+
+        let mut zone = vec![vec![egui::Color32::TRANSPARENT; max_x - min_x + 1]; max_y - min_y + 1];
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                zone[y - min_y][x - min_x] = pixels[y][x];
+            }
+        }
+        let height_zone = max_y - min_y;
+        for y in min_y..=max_y {
+            for x in min_x..=max_x {
+                let zy = y - min_y;
+                let flipped_zy = height_zone - zy;
+                pixels[y][x] = zone[flipped_zy][x - min_x];
+            }
+        }
+
+        self.texture_dirty = true;
+        self.last_status = Some("Miroir vertical appliqué".to_string());
+    }
+
     // -----------------------------------------------------------------------
     // Format projet .drawmepix + auto-save
     // -----------------------------------------------------------------------
@@ -2216,7 +2277,46 @@ impl eframe::App for DrawMePixApp {
                 {
                     self.zoom = (self.zoom * 1.25).min(MAX_ZOOM);
                 }
+                ui.separator();
+                ui.scope(|ui| {
+                    ui.add_enabled_ui(!self.history.is_empty(), |ui| {
+                        if ui
+                            .button("⟲ Annuler")
+                            .on_hover_text("Annuler (Cmd+Z)")
+                            .clicked()
+                        {
+                            self.undo();
+                        }
+                    });
 
+                    ui.add_enabled_ui(!self.redo_stack.is_empty(), |ui| {
+                        if ui
+                            .button("⟳ Rétablir")
+                            .on_hover_text("Rétablir (Cmd+Shift+Z)")
+                            .clicked()
+                        {
+                            self.redo();
+                        }
+                    });
+                });
+                ui.separator();
+
+                ui.scope(|ui| {
+                    if ui
+                        .button("⇆ Miroir H")
+                        .on_hover_text("Miroir horizontal de la sélection (ou de tout le canvas)")
+                        .clicked()
+                    {
+                        self.flip_horizontal_selection();
+                    }
+                    if ui
+                        .button("⇅ Miroir V")
+                        .on_hover_text("Miroir vertical de la sélection (ou de tout le canvas)")
+                        .clicked()
+                    {
+                        self.flip_vertical_selection();
+                    }
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(format!("Zoom : {:.0} %", self.zoom * 100.0));
                     ui.separator();

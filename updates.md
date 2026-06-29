@@ -3,6 +3,22 @@
 Format inspiré de [Keep a Changelog](https://keepachangelog.com/fr/).
 Ordre antichronologique : version la plus récente en haut.
 
+## [1.6.0] — 2026-06-29
+
+### Ajouté
+- **Boutons Annuler / Rétablir dans la barre du menu** : accès direct à
+  l'historique sans passer par le menu Édition. Le bouton est grisé quand
+  rien n'est annulable ou rétablissable. Raccourcis clavier Cmd+Z et
+  Cmd+Shift+Z toujours actifs en parallèle
+- **Miroir horizontal et vertical** de la sélection rectangulaire (ou de
+  l'ensemble du canvas si aucune sélection active). Boutons « ⇆ Miroir H »
+  et « ⇅ Miroir V » dans la barre du menu, à côté des boutons Annuler /
+  Rétablir. Action intégrée à l'historique undo/redo
+
+### Limitations connues
+- Le miroir ne fonctionne pas encore avec la sélection lasso (utilise le
+  rectangle englobant uniquement). Sera étendu dans une version ultérieure
+
 ## [1.5.2] — 2026-06-25
 
 ### Corrigé
